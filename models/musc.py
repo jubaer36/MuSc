@@ -7,6 +7,8 @@ sys.path.append('./models/backbone')
 
 import datasets.mvtec as mvtec
 from datasets.mvtec import _CLASSNAMES as _CLASSNAMES_mvtec_ad
+import datasets.mvtec_ad2 as mvtec_ad2
+from datasets.mvtec_ad2 import _CLASSNAMES as _CLASSNAMES_mvtec_ad2
 import datasets.visa as visa
 from datasets.visa import _CLASSNAMES as _CLASSNAMES_visa
 import datasets.btad as btad
@@ -17,7 +19,7 @@ import models.backbone._backbones as _backbones
 from models.modules._LNAMD import LNAMD
 from models.modules._MSM import MSM
 from models.modules._RsCIN import RsCIN
-from utils.metrics import compute_metrics
+from utils.metrics import compute_metrics, find_best_threshold, compute_segf1_at_threshold
 from openpyxl import Workbook
 from tqdm import tqdm
 import pickle
@@ -47,6 +49,8 @@ class MuSc():
                     self.categories = _CLASSNAMES_visa
                 elif self.dataset == 'mvtec_ad':
                     self.categories = _CLASSNAMES_mvtec_ad
+                elif self.dataset == 'mvtec_ad2':
+                    self.categories = _CLASSNAMES_mvtec_ad2
                 elif self.dataset == 'btad':
                     self.categories = _CLASSNAMES_btad
             else:
@@ -84,6 +88,10 @@ class MuSc():
                                                 divide_num=divide_num, divide_iter=divide_iter, random_seed=self.seed)
         elif self.dataset == 'mvtec_ad':
             test_dataset = mvtec.MVTecDataset(source=self.path, split=mvtec.DatasetSplit.TEST,
+                                            classname=category, resize=self.image_size, imagesize=self.image_size, clip_transformer=self.preprocess,
+                                                divide_num=divide_num, divide_iter=divide_iter, random_seed=self.seed)
+        elif self.dataset == 'mvtec_ad2':
+            test_dataset = mvtec_ad2.MVTecAD2Dataset(source=self.path, split=mvtec_ad2.DatasetSplit.TEST,
                                             classname=category, resize=self.image_size, imagesize=self.image_size, clip_transformer=self.preprocess,
                                                 divide_num=divide_num, divide_iter=divide_iter, random_seed=self.seed)
         elif self.dataset == 'btad':
@@ -243,6 +251,8 @@ class MuSc():
             k_score = [1, 8, 9]
         elif self.dataset == 'mvtec_ad':
             k_score = [1, 2, 3]
+        elif self.dataset == 'mvtec_ad2':
+            k_score = [1, 2, 3]
         else:
             k_score = [1, 2, 3]
         scores_cls = RsCIN(ac_score, class_tokens, k_list=k_score)
@@ -256,14 +266,15 @@ class MuSc():
         auroc_sp, f1_sp, ap_sp = image_metric
         auroc_px, f1_px, ap_px, aupro = pixel_metric
         print(category)
-        print('image-level, auroc:{}, f1:{}, ap:{}'.format(auroc_sp*100, f1_sp*100, ap_sp*100))
-        print('pixel-level, auroc:{}, f1:{}, ap:{}, aupro:{}'.format(auroc_px*100, f1_px*100, ap_px*100, aupro*100))
+        print('image-level, auroc:{:.2f}, f1:{:.2f}, ap:{:.2f}'.format(auroc_sp*100, f1_sp*100, ap_sp*100))
+        print('pixel-level, auroc:{:.2f}, f1_max:{:.2f}, ap:{:.2f}, aupro:{:.2f}'.format(
+            auroc_px*100, f1_px*100, ap_px*100, aupro*100))
 
         if self.vis:
             print('visualization...')
             self.visualization(image_path_list, gt_list, pr_px, category)
-    
-        return image_metric, pixel_metric
+
+        return image_metric, pixel_metric, pr_px, gt_px
 
 
     def main(self):
@@ -274,8 +285,11 @@ class MuSc():
         f1_px_ls = []
         ap_px_ls = []
         aupro_ls = []
+        pr_px_all = []   # raw anomaly maps per category for dataset-wide threshold
+        gt_px_all = []   # raw GT masks per category
+
         for category in self.categories:
-            image_metric, pixel_metric = self.make_category_data(category=category,)
+            image_metric, pixel_metric, pr_px_cat, gt_px_cat = self.make_category_data(category=category)
             auroc_sp, f1_sp, ap_sp = image_metric
             auroc_px, f1_px, ap_px, aupro = pixel_metric
             auroc_sp_ls.append(auroc_sp)
@@ -285,6 +299,23 @@ class MuSc():
             f1_px_ls.append(f1_px)
             ap_px_ls.append(ap_px)
             aupro_ls.append(aupro)
+            pr_px_all.append(pr_px_cat)
+            gt_px_all.append(gt_px_cat)
+
+        # Find the single threshold that maximises F1 across ALL categories combined.
+        # This is the dataset-level threshold used for segF1 reporting.
+        combined_pr = np.concatenate([p.ravel() for p in pr_px_all])
+        combined_gt = np.concatenate([g.ravel() for g in gt_px_all])
+        dataset_threshold = find_best_threshold(combined_gt.astype(np.int32), combined_pr)
+        del combined_pr, combined_gt
+        print('\ndataset-wide optimal threshold: {:.6f}'.format(dataset_threshold))
+
+        segf1_ls = [
+            compute_segf1_at_threshold(gt_px_all[i].astype(np.int32), pr_px_all[i], dataset_threshold)
+            for i in range(len(self.categories))
+        ]
+        del pr_px_all, gt_px_all
+
         # mean
         auroc_sp_mean = sum(auroc_sp_ls) / len(auroc_sp_ls)
         f1_sp_mean = sum(f1_sp_ls) / len(f1_sp_ls)
@@ -293,14 +324,20 @@ class MuSc():
         f1_px_mean = sum(f1_px_ls) / len(f1_px_ls)
         ap_px_mean = sum(ap_px_ls) / len(ap_px_ls)
         aupro_mean = sum(aupro_ls) / len(aupro_ls)
+        segf1_mean = sum(segf1_ls) / len(segf1_ls)
 
+        print()
         for i, category in enumerate(self.categories):
             print(category)
-            print('image-level, auroc:{}, f1:{}, ap:{}'.format(auroc_sp_ls[i]*100, f1_sp_ls[i]*100, ap_sp_ls[i]*100))
-            print('pixel-level, auroc:{}, f1:{}, ap:{}, aupro:{}'.format(auroc_px_ls[i]*100, f1_px_ls[i]*100, ap_px_ls[i]*100, aupro_ls[i]*100))
+            print('image-level, auroc:{:.2f}, f1:{:.2f}, ap:{:.2f}'.format(
+                auroc_sp_ls[i]*100, f1_sp_ls[i]*100, ap_sp_ls[i]*100))
+            print('pixel-level, auroc:{:.2f}, f1_max:{:.2f}, ap:{:.2f}, aupro:{:.2f}, segf1:{:.2f}'.format(
+                auroc_px_ls[i]*100, f1_px_ls[i]*100, ap_px_ls[i]*100, aupro_ls[i]*100, segf1_ls[i]*100))
         print('mean')
-        print('image-level, auroc:{}, f1:{}, ap:{}'.format(auroc_sp_mean*100, f1_sp_mean*100, ap_sp_mean*100))
-        print('pixel-level, auroc:{}, f1:{}, ap:{}, aupro:{}'.format(auroc_px_mean*100, f1_px_mean*100, ap_px_mean*100, aupro_mean*100))
+        print('image-level, auroc:{:.2f}, f1:{:.2f}, ap:{:.2f}'.format(
+            auroc_sp_mean*100, f1_sp_mean*100, ap_sp_mean*100))
+        print('pixel-level, auroc:{:.2f}, f1_max:{:.2f}, ap:{:.2f}, aupro:{:.2f}, segf1:{:.2f}'.format(
+            auroc_px_mean*100, f1_px_mean*100, ap_px_mean*100, aupro_mean*100, segf1_mean*100))
         
         # save in excel
         if self.save_excel:
@@ -308,12 +345,13 @@ class MuSc():
             sheet = workbook.active
             sheet.title = "MuSc_results"
             sheet.cell(row=1,column=2,value='auroc_px')
-            sheet.cell(row=1,column=3,value='f1_px')
+            sheet.cell(row=1,column=3,value='f1_max_px')
             sheet.cell(row=1,column=4,value='ap_px')
             sheet.cell(row=1,column=5,value='aupro')
-            sheet.cell(row=1,column=6,value='auroc_sp')
-            sheet.cell(row=1,column=7,value='f1_sp')
-            sheet.cell(row=1,column=8,value='ap_sp')
+            sheet.cell(row=1,column=6,value='segf1')
+            sheet.cell(row=1,column=7,value='auroc_sp')
+            sheet.cell(row=1,column=8,value='f1_sp')
+            sheet.cell(row=1,column=9,value='ap_sp')
             for col_index in range(2):
                 for row_index in range(len(self.categories)):
                     if col_index == 0:
@@ -323,9 +361,10 @@ class MuSc():
                         sheet.cell(row=row_index+2,column=col_index+2,value=f1_px_ls[row_index]*100)
                         sheet.cell(row=row_index+2,column=col_index+3,value=ap_px_ls[row_index]*100)
                         sheet.cell(row=row_index+2,column=col_index+4,value=aupro_ls[row_index]*100)
-                        sheet.cell(row=row_index+2,column=col_index+5,value=auroc_sp_ls[row_index]*100)
-                        sheet.cell(row=row_index+2,column=col_index+6,value=f1_sp_ls[row_index]*100)
-                        sheet.cell(row=row_index+2,column=col_index+7,value=ap_sp_ls[row_index]*100)
+                        sheet.cell(row=row_index+2,column=col_index+5,value=segf1_ls[row_index]*100)
+                        sheet.cell(row=row_index+2,column=col_index+6,value=auroc_sp_ls[row_index]*100)
+                        sheet.cell(row=row_index+2,column=col_index+7,value=f1_sp_ls[row_index]*100)
+                        sheet.cell(row=row_index+2,column=col_index+8,value=ap_sp_ls[row_index]*100)
                     if row_index == len(self.categories)-1:
                         if col_index == 0:
                             sheet.cell(row=row_index+3,column=col_index+1,value='mean')
@@ -334,9 +373,10 @@ class MuSc():
                             sheet.cell(row=row_index+3,column=col_index+2,value=f1_px_mean*100)
                             sheet.cell(row=row_index+3,column=col_index+3,value=ap_px_mean*100)
                             sheet.cell(row=row_index+3,column=col_index+4,value=aupro_mean*100)
-                            sheet.cell(row=row_index+3,column=col_index+5,value=auroc_sp_mean*100)
-                            sheet.cell(row=row_index+3,column=col_index+6,value=f1_sp_mean*100)
-                            sheet.cell(row=row_index+3,column=col_index+7,value=ap_sp_mean*100)
+                            sheet.cell(row=row_index+3,column=col_index+5,value=segf1_mean*100)
+                            sheet.cell(row=row_index+3,column=col_index+6,value=auroc_sp_mean*100)
+                            sheet.cell(row=row_index+3,column=col_index+7,value=f1_sp_mean*100)
+                            sheet.cell(row=row_index+3,column=col_index+8,value=ap_sp_mean*100)
             workbook.save(os.path.join(self.output_dir, 'results.xlsx'))
 
 

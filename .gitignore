@@ -1,0 +1,11 @@
+data/*
+datasets/__pycache__/*
+models/__pycache__/*
+models/backbone/__pycache__/*
+models/backbone/dinov2/__pycache__/*
+models/backbone/open_clip/__pycache__/*
+models/modules/__pycache__/*
+utils/__pycache__/*
+MVTecAD2_public_code_utils/*
+scripts/__pycache__/*
+submission_folder/*

@@ -1,5 +1,5 @@
 datasets:
-  dataset_name: 'mvtec_ad'  # choice ['mvtec_ad', 'visa']
+  dataset_name: 'mvtec_ad'  # choice ['mvtec_ad', 'mvtec_ad2', 'visa', 'btad']
   data_path: ./data/mvtec_anomaly_detection/
   class_name: 'ALL'
   img_resize: 518
