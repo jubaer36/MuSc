@@ -9,3 +9,5 @@ utils/__pycache__/*
 MVTecAD2_public_code_utils/*
 scripts/__pycache__/*
 submission_folder/*
+submission_folder.tar.gz
+dinov3_vitl16_submission_folder/*

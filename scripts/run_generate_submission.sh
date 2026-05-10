@@ -1,9 +1,9 @@
 #!/bin/bash
-# Generate MVTec AD2 submission using threshold from mvtec2.log (0.628772)
+# Generate MVTec AD2 submission using CLIP ViT-L-14-336.
+# Uses fixed threshold from mvtec2.log.
+# Submission saved to: ./vit_l_14_336_submission_folder/
 
 python scripts/generate_submission.py \
-    --data_path ./data/mvtec_ad_2/ \
-    --submission_dir ./submission_folder \
     --backbone_name ViT-L-14-336 \
     --pretrained openai \
     --img_resize 518 \
