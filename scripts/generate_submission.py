@@ -47,6 +47,27 @@ warnings.filterwarnings("ignore")
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
+
+# ------------------------------------------------------------------
+# SAM refiner helper
+# ------------------------------------------------------------------
+def load_sam_refiner(args, device):
+    """Return a SAMRefiner if --sam_enabled, else None."""
+    if not getattr(args, 'sam_enabled', False):
+        return None
+    from models.sam_refiner import SAMRefiner
+    refiner = SAMRefiner(
+        checkpoint=args.sam_checkpoint,
+        model_type=getattr(args, 'sam_model_type', 'vit_h'),
+        device=str(device),
+        threshold_percentile=getattr(args, 'sam_threshold_percentile', 95),
+        blend_alpha=getattr(args, 'sam_blend_alpha', 0.3),
+        n_neg=getattr(args, 'sam_n_neg', 5),
+    )
+    print(f"SAM refiner loaded: {args.sam_checkpoint} ({getattr(args, 'sam_model_type', 'vit_h')})")
+    return refiner
+
+
 _CLASSNAMES = [
     "can", "fabric", "fruit_jelly", "rice",
     "sheet_metal", "vial", "wallplugs", "walnuts",
@@ -257,18 +278,21 @@ def run_inference(
 # ------------------------------------------------------------------
 # Phase 1: compute threshold from test_public
 # ------------------------------------------------------------------
-def compute_threshold_from_public(args, model, preprocess, backbone_type, device):
+def compute_threshold_from_public(args, model, preprocess, backbone_type, device, sam_refiner=None):
     import datasets.mvtec_ad2 as mvtec_ad2
 
     features_list = [l + 1 for l in args.feature_layers]
 
     print("\n" + "=" * 60)
-    print("Phase 1: computing threshold from test_public")
+    print("Phase 1: computing threshold + segF1 from test_public")
     print("=" * 60)
 
     auroc_sp_ls, f1_sp_ls, ap_sp_ls = [], [], []
     auroc_px_ls, f1_px_ls, ap_px_ls, aupro_ls = [], [], [], []
     pr_samples, gt_samples = [], []
+    # full maps kept in memory so segF1 can be computed after threshold is known
+    cat_maps = {}   # category -> (N, 1, H, W) float32
+    cat_gt   = {}   # category -> (N, H, W) int32
     valid_cats = []
 
     for category in args.classes:
@@ -289,7 +313,7 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
             print("  No images, skipping.")
             continue
 
-        anomaly_maps, _, gt_masks = run_inference(
+        anomaly_maps, image_paths, gt_masks = run_inference(
             dataset=dataset,
             model=model,
             backbone_type=backbone_type,
@@ -301,13 +325,21 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
             with_masks=True,
         )
 
+        if sam_refiner is not None:
+            print("  SAM refinement ...")
+            anomaly_maps = sam_refiner.refine_batch(image_paths, anomaly_maps, args.img_resize)
+
         pr_px = anomaly_maps
         gt_px = gt_masks.astype(np.int32) if gt_masks is not None else None
+        if gt_px is None or gt_px.sum() == 0:
+            print("  No GT mask pixels — skipping.")
+            del anomaly_maps, gt_masks
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
+
         pr_sp = pr_px.reshape(len(pr_px), -1).max(-1)
-        gt_sp = (
-            (gt_px.reshape(len(gt_px), -1).max(-1) > 0).astype(np.int32)
-            if gt_px is not None else None
-        )
+        gt_sp = (gt_px.reshape(len(gt_px), -1).max(-1) > 0).astype(np.int32)
 
         image_metric, pixel_metric = compute_metrics(gt_sp, pr_sp, gt_px, pr_px)
         auroc_sp, f1_sp, ap_sp = image_metric
@@ -318,15 +350,19 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
         ap_px_ls.append(ap_px);       aupro_ls.append(aupro)
         valid_cats.append(category)
 
+        # subsample for threshold computation
         n_px = pr_px.ravel().shape[0]
         n_samp = min(150_000, n_px)
         rng = np.random.default_rng(42)
         idx = rng.choice(n_px, n_samp, replace=False)
         pr_samples.append(pr_px.ravel()[idx].astype(np.float32))
-        if gt_px is not None:
-            gt_samples.append(gt_px.ravel()[idx].astype(np.int32))
+        gt_samples.append(gt_px.ravel()[idx].astype(np.int32))
 
-        del anomaly_maps, gt_masks, pr_px, gt_px
+        # keep full maps for segF1 after threshold is known
+        cat_maps[category] = pr_px           # (N, 1, H, W)
+        cat_gt[category]   = gt_px           # (N, 1, H, W) or (N, H, W)
+
+        del anomaly_maps, gt_masks
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -334,12 +370,19 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
         raise RuntimeError("No test_public data found.")
 
     combined_pr = np.concatenate(pr_samples)
-    combined_gt = np.concatenate(gt_samples) if gt_samples else None
-    if combined_gt is None or combined_gt.sum() == 0:
+    combined_gt = np.concatenate(gt_samples)
+    if combined_gt.sum() == 0:
         raise RuntimeError("No anomalous pixels in test_public GT.")
 
     threshold = find_best_threshold(combined_gt, combined_pr)
     del combined_pr, combined_gt, pr_samples, gt_samples
+
+    # compute segF1 at global threshold using full stored maps
+    segf1_ls = []
+    for cat in valid_cats:
+        sf = compute_segf1_at_threshold(cat_gt[cat].astype(np.int32), cat_maps[cat], threshold)
+        segf1_ls.append(sf)
+    del cat_maps, cat_gt
 
     print(f"\n  Global threshold: {threshold:.6f}")
     print("\n  Per-category metrics (test_public):")
@@ -348,14 +391,16 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
             f"  {cat:12s}  "
             f"auroc_px:{auroc_px_ls[i]*100:.1f}  f1_max:{f1_px_ls[i]*100:.1f}  "
             f"ap:{ap_px_ls[i]*100:.1f}  aupro:{aupro_ls[i]*100:.1f}  "
+            f"segf1:{segf1_ls[i]*100:.1f}  "
             f"auroc_sp:{auroc_sp_ls[i]*100:.1f}  f1_sp:{f1_sp_ls[i]*100:.1f}"
         )
     n = len(valid_cats)
     if n > 0:
         print(
-            f"  {chr(39)+'mean'+chr(39):12s}  "
+            f"  {'mean':12s}  "
             f"auroc_px:{sum(auroc_px_ls)/n*100:.1f}  f1_max:{sum(f1_px_ls)/n*100:.1f}  "
             f"ap:{sum(ap_px_ls)/n*100:.1f}  aupro:{sum(aupro_ls)/n*100:.1f}  "
+            f"segf1:{sum(segf1_ls)/n*100:.1f}  "
             f"auroc_sp:{sum(auroc_sp_ls)/n*100:.1f}  f1_sp:{sum(f1_sp_ls)/n*100:.1f}"
         )
 
@@ -412,6 +457,12 @@ def main():
                         help="Default: ./{backbone_short}_submission_folder")
     parser.add_argument("--output_dir",     default=None,
                         help="Default: ./output/mvtec_ad2/{backbone_short}")
+    parser.add_argument("--sam_enabled",               action="store_true", default=False)
+    parser.add_argument("--sam_checkpoint",            default="./models/sam_vit_h.pth")
+    parser.add_argument("--sam_model_type",            default="vit_h")
+    parser.add_argument("--sam_threshold_percentile",  type=float, default=95.0)
+    parser.add_argument("--sam_blend_alpha",           type=float, default=0.3)
+    parser.add_argument("--sam_n_neg",                 type=int,   default=5)
 
     args = parser.parse_args()
 
@@ -434,8 +485,10 @@ def main():
         args.backbone_name, args.pretrained, args.img_resize, device
     )
 
+    sam_refiner = load_sam_refiner(args, device)
+
     if args.threshold is None:
-        threshold = compute_threshold_from_public(args, model, preprocess, backbone_type, device)
+        threshold = compute_threshold_from_public(args, model, preprocess, backbone_type, device, sam_refiner)
     else:
         threshold = args.threshold
 
@@ -467,6 +520,10 @@ def main():
                 batch_size=args.batch_size,
                 image_size=args.img_resize,
             )
+
+            if sam_refiner is not None:
+                print("  SAM refinement ...")
+                anomaly_maps = sam_refiner.refine_batch(image_paths, anomaly_maps, args.img_resize)
 
             save_maps(
                 anomaly_maps=anomaly_maps,

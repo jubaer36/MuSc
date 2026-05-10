@@ -26,6 +26,12 @@ def get_args():
     parser.add_argument('--img_resize', type=int, default=None, help='image size')
     parser.add_argument('--batch_size', type=int, default=None, help='batch size')
     parser.add_argument('--divide_num', type=int, default=None, help='the number of divided subsets')
+    parser.add_argument('--sam_enabled', type=str, default=None, help='enable SAM refinement (True/False)')
+    parser.add_argument('--sam_checkpoint', type=str, default=None, help='path to SAM checkpoint')
+    parser.add_argument('--sam_model_type', type=str, default=None, help='SAM model type (vit_h/vit_l/vit_b)')
+    parser.add_argument('--sam_threshold_percentile', type=float, default=None, help='heatmap percentile for SAM region detection')
+    parser.add_argument('--sam_blend_alpha', type=float, default=None, help='SAM mask blend weight (0-1)')
+    parser.add_argument('--sam_n_neg', type=int, default=None, help='negative point prompts per SAM region')
     args = parser.parse_args()
     return args
 
@@ -75,6 +81,20 @@ def load_args(cfg, args):
         cfg['models']['batch_size'] = args.batch_size
     if args.divide_num is not None:
         cfg['datasets']['divide_num'] = args.divide_num
+    if 'sam' not in cfg:
+        cfg['sam'] = {}
+    if args.sam_enabled is not None:
+        cfg['sam']['enabled'] = args.sam_enabled.lower() == 'true'
+    if args.sam_checkpoint is not None:
+        cfg['sam']['checkpoint'] = args.sam_checkpoint
+    if args.sam_model_type is not None:
+        cfg['sam']['model_type'] = args.sam_model_type
+    if args.sam_threshold_percentile is not None:
+        cfg['sam']['threshold_percentile'] = args.sam_threshold_percentile
+    if args.sam_blend_alpha is not None:
+        cfg['sam']['blend_alpha'] = args.sam_blend_alpha
+    if args.sam_n_neg is not None:
+        cfg['sam']['n_neg'] = args.sam_n_neg
     return cfg
 
 if __name__ == "__main__":

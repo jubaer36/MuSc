@@ -22,6 +22,7 @@ sys.path.insert(0, _ROOT)
 
 from scripts.generate_submission import (
     load_backbone,
+    load_sam_refiner,
     run_inference,
     get_backbone_type,
 )
@@ -47,6 +48,12 @@ def main():
     parser.add_argument("--batch_size",    type=int, default=4)
     parser.add_argument("--device",        type=int, default=0)
     parser.add_argument("--classes",       nargs="+", default=_CLASSNAMES)
+    parser.add_argument("--sam_enabled",               action="store_true", default=False)
+    parser.add_argument("--sam_checkpoint",            default="./models/sam_vit_h.pth")
+    parser.add_argument("--sam_model_type",            default="vit_h")
+    parser.add_argument("--sam_threshold_percentile",  type=float, default=95.0)
+    parser.add_argument("--sam_blend_alpha",           type=float, default=0.3)
+    parser.add_argument("--sam_n_neg",                 type=int,   default=5)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -60,6 +67,8 @@ def main():
     model, preprocess, backbone_type = load_backbone(
         args.backbone_name, args.pretrained, args.img_resize, device
     )
+
+    sam_refiner = load_sam_refiner(args, device)
 
     import datasets.mvtec_ad2 as mvtec_ad2
 
@@ -91,7 +100,7 @@ def main():
             print("  No images.")
             continue
 
-        anomaly_maps, _, gt_masks = run_inference(
+        anomaly_maps, image_paths, gt_masks = run_inference(
             dataset=dataset,
             model=model,
             backbone_type=backbone_type,
@@ -102,6 +111,10 @@ def main():
             image_size=args.img_resize,
             with_masks=True,
         )
+
+        if sam_refiner is not None:
+            print("  SAM refinement ...")
+            anomaly_maps = sam_refiner.refine_batch(image_paths, anomaly_maps, args.img_resize)
 
         if gt_masks is None or gt_masks.sum() == 0:
             print("  No GT mask pixels — skipping.")

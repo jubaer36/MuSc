@@ -66,19 +66,48 @@ class MuSc():
         self.output_dir = os.path.join(cfg['testing']['output_dir'], self.dataset, self.model_name, 'imagesize{}'.format(self.image_size))
         os.makedirs(self.output_dir, exist_ok=True)
         self.load_backbone()
+        self._load_sam(cfg)
 
 
     def load_backbone(self):
-        if 'dino' in self.model_name:
-            # dino or dino_v2
+        if 'dinov3' in self.model_name or self.model_name.startswith('facebook/'):
+            from models.backbone.dinov3_backbone import load_dinov3
+            self.dino_model = load_dinov3(self.model_name, self.device)
+            self.backbone_type = 'dinov3'
+            self.preprocess = None
+        elif 'dinov2' in self.model_name:
             self.dino_model = _backbones.load(self.model_name)
             self.dino_model.to(self.device)
+            self.backbone_type = 'dinov2'
+            self.preprocess = None
+        elif 'dino' in self.model_name:
+            self.dino_model = _backbones.load(self.model_name)
+            self.dino_model.to(self.device)
+            self.backbone_type = 'dino'
             self.preprocess = None
         else:
             # clip
             self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(self.model_name, self.image_size, pretrained=self.pretrained)
             self.clip_model.to(self.device)
+            self.backbone_type = 'clip'
 
+
+    def _load_sam(self, cfg):
+        sam_cfg = cfg.get('sam', {})
+        if sam_cfg.get('enabled', False):
+            from models.sam_refiner import SAMRefiner
+            device_str = 'cuda:{}'.format(cfg['device']) if torch.cuda.is_available() else 'cpu'
+            self.sam_refiner = SAMRefiner(
+                checkpoint=sam_cfg['checkpoint'],
+                model_type=sam_cfg.get('model_type', 'vit_h'),
+                device=device_str,
+                threshold_percentile=sam_cfg.get('threshold_percentile', 95),
+                blend_alpha=sam_cfg.get('blend_alpha', 0.3),
+                n_neg=sam_cfg.get('n_neg', 5),
+            )
+            print('SAM refiner loaded: {} ({})'.format(sam_cfg['checkpoint'], sam_cfg.get('model_type', 'vit_h')))
+        else:
+            self.sam_refiner = None
 
     def load_datasets(self, category, divide_num=1, divide_iter=0):
         # dataloader
@@ -168,17 +197,23 @@ class MuSc():
                     gt_list.extend(list(image_info["is_anomaly"].numpy()))
                 with torch.no_grad(), torch.cuda.amp.autocast():
                     input_image = image.to(torch.float).to(self.device)
-                    if 'dinov2' in self.model_name:
-                        patch_tokens = self.dino_model.get_intermediate_layers(x=input_image, n=[l-1 for l in self.features_list], return_class_token=False)
+                    if self.backbone_type == 'dinov3':
+                        raw = self.dino_model.get_intermediate_layers(
+                            x=input_image, n=[l - 1 for l in self.features_list], return_class_token=False)
                         image_features = self.dino_model(input_image)
-                        patch_tokens = [patch_tokens[l].cpu() for l in range(len(self.features_list))]
-                        fake_cls = [torch.zeros_like(p)[:, 0:1, :] for p in patch_tokens]
-                        patch_tokens = [torch.cat([fake_cls[i], patch_tokens[i]], dim=1) for i in range(len(patch_tokens))]
-                    elif 'dino' in self.model_name:
+                        fake_cls = [torch.zeros_like(t)[:, :1, :] for t in raw]
+                        patch_tokens = [torch.cat([fake_cls[i], raw[i]], dim=1).cpu() for i in range(len(self.features_list))]
+                    elif self.backbone_type == 'dinov2':
+                        raw = self.dino_model.get_intermediate_layers(x=input_image, n=[l-1 for l in self.features_list], return_class_token=False)
+                        image_features = self.dino_model(input_image)
+                        raw = [raw[l].cpu() for l in range(len(self.features_list))]
+                        fake_cls = [torch.zeros_like(p)[:, :1, :] for p in raw]
+                        patch_tokens = [torch.cat([fake_cls[i], raw[i]], dim=1) for i in range(len(raw))]
+                    elif self.backbone_type == 'dino':
                         patch_tokens_all = self.dino_model.get_intermediate_layers(x=input_image, n=max(self.features_list))
                         image_features = self.dino_model(input_image)
                         patch_tokens = [patch_tokens_all[l-1].cpu() for l in self.features_list]
-                    else: # clip
+                    else:  # clip
                         image_features, patch_tokens = self.clip_model.encode_image(input_image, self.features_list)
                         image_features /= image_features.norm(dim=-1, keepdim=True)
                         patch_tokens = [patch_tokens[l].cpu() for l in range(len(self.features_list))]
@@ -245,8 +280,8 @@ class MuSc():
         torch.cuda.empty_cache()
 
         B = anomaly_maps.shape[0]   # the number of unlabeled test images
-        ac_score = np.array(anomaly_maps).reshape(B, -1).max(-1)
-        # RsCIN
+        # RsCIN uses raw MuSc max-score per image (SAM output is on a different scale)
+        ac_score = anomaly_maps.reshape(B, -1).max(-1)
         if self.dataset == 'visa':
             k_score = [1, 8, 9]
         elif self.dataset == 'mvtec_ad':
@@ -257,11 +292,17 @@ class MuSc():
             k_score = [1, 2, 3]
         scores_cls = RsCIN(ac_score, class_tokens, k_list=k_score)
 
+        # SAM refines pixel-level maps only; image-level classification unchanged
+        if self.sam_refiner is not None:
+            print('SAM refinement...')
+            pr_px = self.sam_refiner.refine_batch(image_path_list, anomaly_maps, self.image_size)
+        else:
+            pr_px = anomaly_maps
+
         print('computing metrics...')
         pr_sp = np.array(scores_cls)
         gt_sp = np.array(gt_list)
         gt_px = torch.cat(img_masks, dim=0).numpy().astype(np.int32)
-        pr_px = np.array(anomaly_maps)
         image_metric, pixel_metric = compute_metrics(gt_sp, pr_sp, gt_px, pr_px)
         auroc_sp, f1_sp, ap_sp = image_metric
         auroc_px, f1_px, ap_px, aupro = pixel_metric

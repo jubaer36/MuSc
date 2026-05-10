@@ -490,3 +490,7 @@ Our repo is built on [PatchCore](https://github.com/amazon-science/patchcore-ins
 
 ## License: <a href='#all_catelogue'>[Back to Catalogue]</a>
 MuSc is released under the **MIT Licence**, and is fully open for academic research and also allow free commercial usage. To apply for a commercial license, please contact yuzhou@hust.edu.cn.
+
+
+
+
