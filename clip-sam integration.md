@@ -1,0 +1,30 @@
+Refined Pipeline: MuSc-Guided Cascaded Prompt Refinement
+
+Stage 1 — Coarse Anomaly Map from DINOv3-MuSc
+The input image goes through DINOv3 (replacing the original ViT backbone) to extract patch-level features. Those features go through MuSc's existing machinery — local neighborhood aggregation across multiple scales (r = 1, 3, 5), mutual scoring between patches across the test batch, and multi-stage fusion — producing a coarse anomaly heatmap the same spatial size as the original image. Every pixel in this map has a score representing how statistically anomalous that region is. This heatmap is the foundation for everything that follows.
+For image-level anomaly classification, MuSc's RsCIN score is kept entirely unchanged and untouched by the SAM refinement stages. SAM's role is purely segmentation boundary refinement.
+
+Stage 2 — Generating Prompts from the Heatmap
+Before touching SAM, the coarse heatmap is converted into three types of spatial hints.
+Positive points are sampled from the highest-scoring pixels. You take the top-k scoring pixels across the heatmap, but enforce a minimum spacing of 20–40 pixels between selected points. This prevents all positive prompts from collapsing onto a single bright spot and gives SAM a spatially distributed picture of where the anomaly is.
+The anomaly region R is obtained by thresholding the heatmap — keeping pixels above a percentile cutoff (top 5–10%) or using Otsu's method to find the threshold automatically. This gives a rough binary mask of where the anomaly likely lives.
+Negative points are generated from a ring just outside R. You dilate R using a 25×25 ellipse kernel — matching ClipSAM's choice and giving a smooth, direction-uniform expansion rather than the jagged corners a square kernel would produce. The dilation extends the boundary outward by roughly 12 pixels in every direction. Subtracting the original R from the dilated version leaves a ring of pixels that are spatially adjacent to the anomaly but outside it. From this ring you sample the lowest-scoring MuSc pixels as negative prompts. These points are close enough to the defect to be meaningful context for SAM, but confirmed normal by MuSc's statistics. The combination of positive points on the anomaly core and negative points on the immediately surrounding normal surface is what prevents SAM from expanding its mask to cover the whole object.
+
+Stage 3 — First SAM Pass: Points Only
+The positive and negative points are fed to SAM together — no other input at this stage. SAM produces two outputs: a binary segmentation mask M1 and a dense logit map logit1. The mask is SAM's first attempt at the anomaly shape given only the point hints. The logit map is the raw pre-threshold spatial confidence grid — a continuous value per pixel indicating how strongly SAM believes each pixel belongs to the foreground. Both outputs are carried forward.
+
+Stage 4 — Second SAM Pass: Points + Logit
+SAM runs again, this time receiving the same positive and negative points plus logit1 as a dense spatial prior. SAM's architecture supports this — a previous mask logit can be passed back in as an additional input, allowing it to refine its prediction rather than restart from scratch. This produces a refined mask M2 and its corresponding logit2. Boundary quality improves here because the dense logit tells SAM which pixels it was uncertain about in the first pass, and it revises those decisions with the full point context still active.
+
+Stage 5 — Extracting the Bounding Box from M2
+Rather than deriving a bounding box from the heatmap directly, it is extracted from M2 — the mask SAM itself produced in the previous pass. You find the connected components of M2 and draw the tight axis-aligned bounding box around whichever component has the highest average MuSc heatmap score inside it. If only one component exists, that component's box is used directly. This box is geometrically grounded in SAM's own refined prediction rather than in the heatmap's blur, so it faithfully reflects the defect's actual spatial extent at the resolution SAM has already established.
+
+Stage 6 — Third SAM Pass: Points + Box + Logit
+The final SAM run receives all inputs simultaneously: the original positive and negative points, the bounding box from M2, and logit2 from the second pass. This is the most constrained and most informed prompt combination in the cascade. The box anchors the spatial extent. The points confirm the foreground center and the normal surroundings. The dense logit carries the detailed boundary knowledge accumulated across the first two passes. The output M3 is the final anomaly segmentation mask.
+
+Final Output
+For segmentation, M3 is the prediction. It is used directly to compute SegF1 (F1-max-segm), which is evaluated by sweeping a threshold across all predicted score maps dataset-wide and taking the maximum F1 achieved. Every boundary pixel that SAM correctly includes or excludes contributes directly to this metric, which is why the three-pass cascade — progressively sharpening the boundary at each step — translates cleanly into SegF1 gains over the raw MuSc heatmap.
+For image-level anomaly classification, MuSc's RsCIN score stands alone and is not modified. The SAM stages do not touch it.
+
+The Logic of the Cascade
+Each pass builds strictly on the previous one without discarding anything. Pass one gives a rough shape from points alone. Pass two sharpens that shape by feeding its own logit back in. Pass three anchors the sharpened shape within a box derived from pass two's output. At no stage does SAM receive an arbitrary geometric prior — every input to every pass comes either from MuSc's statistical heatmap or from SAM's own previous output. The cascade is fully self-consistent and grounded throughout in MuSc's underlying anomaly signal.
