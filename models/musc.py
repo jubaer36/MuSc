@@ -67,6 +67,22 @@ class MuSc():
         os.makedirs(self.output_dir, exist_ok=True)
         self.load_backbone()
 
+        sam_cfg = cfg.get('sam', {})
+        if sam_cfg.get('use_sam', False):
+            from models.sam_refiner import SAMRefiner
+            self.sam_refiner = SAMRefiner(
+                checkpoint_path=sam_cfg.get('checkpoint', 'models/sam_vit_h.pth'),
+                model_type=sam_cfg.get('model_type', 'vit_h'),
+                device=str(self.device),
+                k_pos=sam_cfg.get('k_pos', 5),
+                k_neg=sam_cfg.get('k_neg', 5),
+                min_spacing_px=sam_cfg.get('min_spacing_px', 30),
+                dilation_kernel=sam_cfg.get('dilation_kernel', 25),
+            )
+            print('SAM refiner loaded.')
+        else:
+            self.sam_refiner = None
+
 
     def load_backbone(self):
         if 'dino' in self.model_name:
@@ -274,7 +290,28 @@ class MuSc():
             print('visualization...')
             self.visualization(image_path_list, gt_list, pr_px, category)
 
-        return image_metric, pixel_metric, pr_px, gt_px
+        pr_px_sam = None
+        if self.sam_refiner is not None:
+            from PIL import Image as PILImage
+            refined = []
+            print('SAM refinement ({} images)...'.format(len(image_path_list)))
+            for i, path in enumerate(image_path_list):
+                img_np = np.array(
+                    PILImage.open(path).convert('RGB').resize(
+                        (self.image_size, self.image_size), PILImage.BILINEAR
+                    )
+                )
+                hmap = pr_px[i].squeeze()
+                m3 = self.sam_refiner.refine(img_np, hmap)
+                if m3.sum() == 0:
+                    refined_map = hmap
+                else:
+                    refined_map = hmap * m3.astype(np.float32)
+                refined.append(refined_map.astype(np.float32)[np.newaxis])
+            pr_px_sam = np.stack(refined, axis=0)
+            print('SAM refinement done.')
+
+        return image_metric, pixel_metric, pr_px, gt_px, pr_px_sam
 
 
     def main(self):
@@ -285,11 +322,12 @@ class MuSc():
         f1_px_ls = []
         ap_px_ls = []
         aupro_ls = []
-        pr_px_all = []   # raw anomaly maps per category for dataset-wide threshold
-        gt_px_all = []   # raw GT masks per category
+        pr_px_all = []      # raw anomaly maps per category for dataset-wide threshold
+        pr_px_sam_all = []  # SAM-refined maps (falls back to raw when SAM disabled)
+        gt_px_all = []      # raw GT masks per category
 
         for category in self.categories:
-            image_metric, pixel_metric, pr_px_cat, gt_px_cat = self.make_category_data(category=category)
+            image_metric, pixel_metric, pr_px_cat, gt_px_cat, pr_px_sam_cat = self.make_category_data(category=category)
             auroc_sp, f1_sp, ap_sp = image_metric
             auroc_px, f1_px, ap_px, aupro = pixel_metric
             auroc_sp_ls.append(auroc_sp)
@@ -300,21 +338,22 @@ class MuSc():
             ap_px_ls.append(ap_px)
             aupro_ls.append(aupro)
             pr_px_all.append(pr_px_cat)
+            pr_px_sam_all.append(pr_px_sam_cat if pr_px_sam_cat is not None else pr_px_cat)
             gt_px_all.append(gt_px_cat)
 
         # Find the single threshold that maximises F1 across ALL categories combined.
-        # This is the dataset-level threshold used for segF1 reporting.
-        combined_pr = np.concatenate([p.ravel() for p in pr_px_all])
+        # Uses SAM-refined maps when available, raw heatmaps otherwise.
+        combined_pr = np.concatenate([p.ravel() for p in pr_px_sam_all])
         combined_gt = np.concatenate([g.ravel() for g in gt_px_all])
         dataset_threshold = find_best_threshold(combined_gt.astype(np.int32), combined_pr)
         del combined_pr, combined_gt
         print('\ndataset-wide optimal threshold: {:.6f}'.format(dataset_threshold))
 
         segf1_ls = [
-            compute_segf1_at_threshold(gt_px_all[i].astype(np.int32), pr_px_all[i], dataset_threshold)
+            compute_segf1_at_threshold(gt_px_all[i].astype(np.int32), pr_px_sam_all[i], dataset_threshold)
             for i in range(len(self.categories))
         ]
-        del pr_px_all, gt_px_all
+        del pr_px_all, pr_px_sam_all, gt_px_all
 
         # mean
         auroc_sp_mean = sum(auroc_sp_ls) / len(auroc_sp_ls)

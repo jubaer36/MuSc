@@ -17,6 +17,15 @@ testing:
   vis_type: single_norm # choice ['single_norm', 'whole_norm']
   save_excel: False
 
+sam:
+  use_sam: False
+  checkpoint: 'models/sam_vit_h.pth'
+  model_type: 'vit_h'
+  k_pos: 5
+  k_neg: 5
+  min_spacing_px: 30
+  dilation_kernel: 25
+
 
 # models['backbone_name'] choice:
 # ViT-B-32 | ViT-B-16 | ViT-B-16-plus-240

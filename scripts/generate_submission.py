@@ -257,7 +257,7 @@ def run_inference(
 # ------------------------------------------------------------------
 # Phase 1: compute threshold from test_public
 # ------------------------------------------------------------------
-def compute_threshold_from_public(args, model, preprocess, backbone_type, device):
+def compute_threshold_from_public(args, model, preprocess, backbone_type, device, sam_refiner=None):
     import datasets.mvtec_ad2 as mvtec_ad2
 
     features_list = [l + 1 for l in args.feature_layers]
@@ -289,7 +289,7 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
             print("  No images, skipping.")
             continue
 
-        anomaly_maps, _, gt_masks = run_inference(
+        anomaly_maps, image_paths, gt_masks = run_inference(
             dataset=dataset,
             model=model,
             backbone_type=backbone_type,
@@ -301,15 +301,15 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
             with_masks=True,
         )
 
-        pr_px = anomaly_maps
         gt_px = gt_masks.astype(np.int32) if gt_masks is not None else None
-        pr_sp = pr_px.reshape(len(pr_px), -1).max(-1)
+        pr_sp = anomaly_maps.reshape(len(anomaly_maps), -1).max(-1)
         gt_sp = (
             (gt_px.reshape(len(gt_px), -1).max(-1) > 0).astype(np.int32)
             if gt_px is not None else None
         )
 
-        image_metric, pixel_metric = compute_metrics(gt_sp, pr_sp, gt_px, pr_px)
+        # Metrics computed on raw float heatmaps (before SAM) for valid AUROC/AUPRO
+        image_metric, pixel_metric = compute_metrics(gt_sp, pr_sp, gt_px, anomaly_maps)
         auroc_sp, f1_sp, ap_sp = image_metric
         auroc_px, f1_px, ap_px, aupro = pixel_metric
 
@@ -318,6 +318,11 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
         ap_px_ls.append(ap_px);       aupro_ls.append(aupro)
         valid_cats.append(category)
 
+        # SAM refinement for threshold computation only
+        if sam_refiner is not None:
+            anomaly_maps = sam_refine_maps(anomaly_maps, image_paths, sam_refiner, args.img_resize)
+
+        pr_px = anomaly_maps
         n_px = pr_px.ravel().shape[0]
         n_samp = min(150_000, n_px)
         rng = np.random.default_rng(42)
@@ -365,20 +370,67 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
 # ------------------------------------------------------------------
 # save helpers
 # ------------------------------------------------------------------
-def save_maps(anomaly_maps, image_paths, category, split, submission_dir, threshold):
+def save_maps(anomaly_maps, image_paths, category, split, submission_dir, threshold,
+              binary_override=None):
+    """Save anomaly maps as tiff (float) and thresholded png (binary).
+
+    anomaly_maps   : (N, 1, H, W) float32 — always saved as float16 tiff
+    binary_override: (N, 1, H, W) float32 {0,1} — when provided, used for png
+                     instead of thresholding anomaly_maps
+    """
     tiff_dir = submission_dir / "anomaly_images" / category / split
     png_dir  = submission_dir / "anomaly_images_thresholded" / category / split
     tiff_dir.mkdir(parents=True, exist_ok=True)
     png_dir.mkdir(parents=True, exist_ok=True)
 
-    for amap, img_path in zip(anomaly_maps, image_paths):
+    for idx, (amap, img_path) in enumerate(zip(anomaly_maps, image_paths)):
         stem    = Path(img_path).stem
         amap_2d = amap.squeeze()
         tifffile.imwrite(str(tiff_dir / f"{stem}.tiff"), amap_2d.astype(np.float16))
-        binary = (amap_2d >= threshold).astype(np.uint8) * 255
+        if binary_override is not None:
+            binary = (binary_override[idx].squeeze() >= 0.5).astype(np.uint8) * 255
+        else:
+            binary = (amap_2d >= threshold).astype(np.uint8) * 255
         Image.fromarray(binary, mode="L").save(str(png_dir / f"{stem}.png"))
 
     print(f"    saved {len(anomaly_maps)} maps -> {tiff_dir}")
+
+
+def sam_refine_maps(anomaly_maps, image_paths, sam_refiner, image_size):
+    """Refine float anomaly maps using SAM mask as a spatial gate.
+
+    Multiplies each heatmap by the SAM binary mask so values outside
+    the SAM-predicted anomaly region are zeroed out while preserving
+    the original float scores inside. Falls back to the raw heatmap
+    when SAM produces an empty mask (flat/normal images).
+
+    Args:
+        anomaly_maps: (N, 1, H, W) float32 numpy
+        image_paths:  list of str, length N
+        sam_refiner:  SAMRefiner instance
+        image_size:   int, target resize resolution
+
+    Returns:
+        (N, 1, H, W) float32 numpy
+    """
+    from PIL import Image as PILImage
+    refined = []
+    for amap, path in tqdm(zip(anomaly_maps, image_paths), total=len(anomaly_maps),
+                           desc="SAM refine"):
+        img_np = np.array(
+            PILImage.open(path).convert("RGB").resize(
+                (image_size, image_size), PILImage.BILINEAR
+            )
+        )
+        hmap = amap.squeeze()
+        m3 = sam_refiner.refine(img_np, hmap)  # (H, W) uint8 {0,1}
+        if m3.sum() == 0:
+            # SAM found no region (flat/normal heatmap) — keep raw heatmap
+            refined_map = hmap
+        else:
+            refined_map = hmap * m3.astype(np.float32)
+        refined.append(refined_map.astype(np.float32)[np.newaxis])
+    return np.stack(refined, axis=0)
 
 
 # ------------------------------------------------------------------
@@ -412,6 +464,14 @@ def main():
                         help="Default: ./{backbone_short}_submission_folder")
     parser.add_argument("--output_dir",     default=None,
                         help="Default: ./output/mvtec_ad2/{backbone_short}")
+    parser.add_argument("--use_sam",         action="store_true", default=False,
+                        help="Enable SAM cascaded prompt refinement for segmentation.")
+    parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth")
+    parser.add_argument("--sam_model_type",  default="vit_h")
+    parser.add_argument("--sam_k_pos",       type=int, default=5)
+    parser.add_argument("--sam_k_neg",       type=int, default=5)
+    parser.add_argument("--sam_spacing",     type=int, default=30)
+    parser.add_argument("--sam_dilation",    type=int, default=25)
 
     args = parser.parse_args()
 
@@ -434,8 +494,24 @@ def main():
         args.backbone_name, args.pretrained, args.img_resize, device
     )
 
+    sam_refiner = None
+    if args.use_sam:
+        from models.sam_refiner import SAMRefiner
+        sam_refiner = SAMRefiner(
+            checkpoint_path=args.sam_checkpoint,
+            model_type=args.sam_model_type,
+            device=str(device),
+            k_pos=args.sam_k_pos,
+            k_neg=args.sam_k_neg,
+            min_spacing_px=args.sam_spacing,
+            dilation_kernel=args.sam_dilation,
+        )
+        print("SAM refiner loaded.")
+
     if args.threshold is None:
-        threshold = compute_threshold_from_public(args, model, preprocess, backbone_type, device)
+        threshold = compute_threshold_from_public(
+            args, model, preprocess, backbone_type, device, sam_refiner=sam_refiner
+        )
     else:
         threshold = args.threshold
 
@@ -468,6 +544,12 @@ def main():
                 image_size=args.img_resize,
             )
 
+            binary_override = None
+            if sam_refiner is not None:
+                binary_override = sam_refine_maps(
+                    anomaly_maps, image_paths, sam_refiner, args.img_resize
+                )
+
             save_maps(
                 anomaly_maps=anomaly_maps,
                 image_paths=image_paths,
@@ -475,6 +557,7 @@ def main():
                 split=split,
                 submission_dir=submission_dir,
                 threshold=threshold,
+                binary_override=binary_override,
             )
 
             del anomaly_maps, image_paths, dataset

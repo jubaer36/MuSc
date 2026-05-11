@@ -24,6 +24,7 @@ from scripts.generate_submission import (
     load_backbone,
     run_inference,
     get_backbone_type,
+    sam_refine_maps,
 )
 from utils.metrics import find_best_threshold, compute_segf1_at_threshold
 
@@ -47,6 +48,14 @@ def main():
     parser.add_argument("--batch_size",    type=int, default=4)
     parser.add_argument("--device",        type=int, default=0)
     parser.add_argument("--classes",       nargs="+", default=_CLASSNAMES)
+    parser.add_argument("--use_sam",         action="store_true", default=False,
+                        help="Enable SAM cascaded prompt refinement for segmentation.")
+    parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth")
+    parser.add_argument("--sam_model_type",  default="vit_h")
+    parser.add_argument("--sam_k_pos",       type=int, default=5)
+    parser.add_argument("--sam_k_neg",       type=int, default=5)
+    parser.add_argument("--sam_spacing",     type=int, default=30)
+    parser.add_argument("--sam_dilation",    type=int, default=25)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -60,6 +69,20 @@ def main():
     model, preprocess, backbone_type = load_backbone(
         args.backbone_name, args.pretrained, args.img_resize, device
     )
+
+    sam_refiner = None
+    if args.use_sam:
+        from models.sam_refiner import SAMRefiner
+        sam_refiner = SAMRefiner(
+            checkpoint_path=args.sam_checkpoint,
+            model_type=args.sam_model_type,
+            device=str(device),
+            k_pos=args.sam_k_pos,
+            k_neg=args.sam_k_neg,
+            min_spacing_px=args.sam_spacing,
+            dilation_kernel=args.sam_dilation,
+        )
+        print("SAM refiner loaded.")
 
     import datasets.mvtec_ad2 as mvtec_ad2
 
@@ -91,7 +114,7 @@ def main():
             print("  No images.")
             continue
 
-        anomaly_maps, _, gt_masks = run_inference(
+        anomaly_maps, image_paths, gt_masks = run_inference(
             dataset=dataset,
             model=model,
             backbone_type=backbone_type,
@@ -106,6 +129,9 @@ def main():
         if gt_masks is None or gt_masks.sum() == 0:
             print("  No GT mask pixels — skipping.")
             continue
+
+        if sam_refiner is not None:
+            anomaly_maps = sam_refine_maps(anomaly_maps, image_paths, sam_refiner, args.img_resize)
 
         gt_i32 = gt_masks.astype(np.int32)
         cat_maps[category] = anomaly_maps          # (N, 1, H, W) float32
