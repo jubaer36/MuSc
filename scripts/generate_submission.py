@@ -370,27 +370,22 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
 # ------------------------------------------------------------------
 # save helpers
 # ------------------------------------------------------------------
-def save_maps(anomaly_maps, image_paths, category, split, submission_dir, threshold,
-              binary_override=None):
-    """Save anomaly maps as tiff (float) and thresholded png (binary).
+def save_maps(anomaly_maps, image_paths, category, split, submission_dir, threshold):
+    """Save anomaly maps as tiff (float16) and thresholded png (binary).
 
-    anomaly_maps   : (N, 1, H, W) float32 — always saved as float16 tiff
-    binary_override: (N, 1, H, W) float32 {0,1} — when provided, used for png
-                     instead of thresholding anomaly_maps
+    anomaly_maps: (N, 1, H, W) float32 — raw or SAM-refined heatmaps.
+                  Saved as float16 tiff; also thresholded at `threshold` for png.
     """
     tiff_dir = submission_dir / "anomaly_images" / category / split
     png_dir  = submission_dir / "anomaly_images_thresholded" / category / split
     tiff_dir.mkdir(parents=True, exist_ok=True)
     png_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, (amap, img_path) in enumerate(zip(anomaly_maps, image_paths)):
+    for amap, img_path in zip(anomaly_maps, image_paths):
         stem    = Path(img_path).stem
         amap_2d = amap.squeeze()
         tifffile.imwrite(str(tiff_dir / f"{stem}.tiff"), amap_2d.astype(np.float16))
-        if binary_override is not None:
-            binary = (binary_override[idx].squeeze() >= 0.5).astype(np.uint8) * 255
-        else:
-            binary = (amap_2d >= threshold).astype(np.uint8) * 255
+        binary  = (amap_2d >= threshold).astype(np.uint8) * 255
         Image.fromarray(binary, mode="L").save(str(png_dir / f"{stem}.png"))
 
     print(f"    saved {len(anomaly_maps)} maps -> {tiff_dir}")
@@ -461,7 +456,7 @@ def main():
         help="Fixed threshold. Omit to auto-compute from test_public.",
     )
     parser.add_argument("--submission_dir", default=None,
-                        help="Default: ./{backbone_short}_submission_folder")
+                        help="Default: ./{backbone_short}_sam_submission_folder")
     parser.add_argument("--output_dir",     default=None,
                         help="Default: ./output/mvtec_ad2/{backbone_short}")
     parser.add_argument("--use_sam",         action="store_true", default=False,
@@ -478,7 +473,7 @@ def main():
     device        = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
     short          = get_short_name(args.backbone_name)
-    submission_dir = Path(args.submission_dir or f"./{short}_submission_folder")
+    submission_dir = Path(args.submission_dir or f"./{short}_sam_submission_folder")
     output_dir     = Path(args.output_dir     or f"./output/mvtec_ad2/{short}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -544,9 +539,8 @@ def main():
                 image_size=args.img_resize,
             )
 
-            binary_override = None
             if sam_refiner is not None:
-                binary_override = sam_refine_maps(
+                anomaly_maps = sam_refine_maps(
                     anomaly_maps, image_paths, sam_refiner, args.img_resize
                 )
 
@@ -557,7 +551,6 @@ def main():
                 split=split,
                 submission_dir=submission_dir,
                 threshold=threshold,
-                binary_override=binary_override,
             )
 
             del anomaly_maps, image_paths, dataset
