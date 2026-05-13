@@ -41,7 +41,7 @@ class Preprocessing(torch.nn.Module):
         self.output_dim = output_dim
         self.preprocessing_modules = torch.nn.ModuleList()
         for input_layer in input_layers:
-            module = MeanMapper(output_dim)
+            module = SimilarityWeightedMapper(output_dim)
             self.preprocessing_modules.append(module)
 
     def forward(self, features):
@@ -59,6 +59,26 @@ class MeanMapper(torch.nn.Module):
     def forward(self, features):
         features = features.reshape(len(features), 1, -1)
         return F.adaptive_avg_pool1d(features, self.preprocessing_dim).squeeze(1)
+
+
+class SimilarityWeightedMapper(torch.nn.Module):
+    def __init__(self, preprocessing_dim):
+        super(SimilarityWeightedMapper, self).__init__()
+        self.preprocessing_dim = preprocessing_dim
+
+    def forward(self, features):
+        # features: (N, C, r, r)
+        N, C, r1, r2 = features.shape
+        center = features[:, :, r1 // 2, r2 // 2]             # (N, C)
+        flat = features.reshape(N, C, -1)                      # (N, C, r*r)
+        dist = torch.norm(flat - center.unsqueeze(-1), dim=1)  # (N, r*r)
+        weights = torch.exp(-dist)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
+        agg = (flat * weights.unsqueeze(1)).sum(dim=-1)        # (N, C)
+        if C == self.preprocessing_dim:
+            return agg
+        agg = agg.unsqueeze(1)
+        return F.adaptive_avg_pool1d(agg, self.preprocessing_dim).squeeze(1)
 
 
 class LNAMD(torch.nn.Module):
