@@ -48,9 +48,9 @@ def main():
     parser.add_argument("--batch_size",    type=int, default=4)
     parser.add_argument("--device",        type=int, default=0)
     parser.add_argument("--classes",       nargs="+", default=_CLASSNAMES)
-    parser.add_argument("--use_sam",         action="store_true", default=False,
+    parser.add_argument("--use_sam",         action="store_true", default=True,
                         help="Enable SAM cascaded prompt refinement for segmentation.")
-    parser.add_argument("--sam_version",     default="sam1", choices=["sam1", "sam3"],
+    parser.add_argument("--sam_version",     default="sam3", choices=["sam1", "sam3"],
                         help="SAM backend: 'sam1' (segment_anything) or 'sam3' (Sam3TrackerModel).")
     # SAM1 args
     parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth",
@@ -61,10 +61,10 @@ def main():
     parser.add_argument("--sam3_model_id",   default="models/sam3",
                         help="SAM3 HuggingFace model ID or local path (used when --sam_version sam3).")
     # Shared args
-    parser.add_argument("--sam_k_pos",       type=int, default=5)
+    parser.add_argument("--sam_k_pos",       type=int, default=2)
     parser.add_argument("--sam_k_neg",       type=int, default=5)
-    parser.add_argument("--sam_spacing",     type=int, default=30)
-    parser.add_argument("--sam_dilation",    type=int, default=25)
+    parser.add_argument("--sam_spacing",     type=int, default=60)
+    parser.add_argument("--sam_dilation",    type=int, default=15)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")

@@ -16,3 +16,5 @@ models/sam_vit_h.pth
 dinov3_vitl16_sam_submission_folder/
 old_submission_folder.tar.gz
 models/sam3/*
+dinov3_vitl16_sam3_parameter_tuned_submission_folder/*
+dinov3_vitl16_sam3_parameter_tuned_submission_folder.tar.gz
