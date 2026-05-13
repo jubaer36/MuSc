@@ -30,6 +30,7 @@ sam:
   k_neg: 5
   min_spacing_px: 30
   dilation_kernel: 25
+  consistency_iou_threshold: 0.4
 
 
 # models['backbone_name'] choice:

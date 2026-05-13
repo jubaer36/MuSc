@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=60)
     parser.add_argument("--sam_dilation",    type=int, default=15)
+    parser.add_argument("--sam_iou_threshold", type=float, default=0.4,
+                        help="IoU gate: use M2 instead of M3 when IoU(M2,M3) < this value.")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -92,6 +94,7 @@ def main():
                 k_neg=args.sam_k_neg,
                 min_spacing_px=args.sam_spacing,
                 dilation_kernel=args.sam_dilation,
+                consistency_iou_threshold=args.sam_iou_threshold,
             )
         else:
             sam_refiner = create_sam_refiner(
@@ -102,6 +105,7 @@ def main():
                 k_neg=args.sam_k_neg,
                 min_spacing_px=args.sam_spacing,
                 dilation_kernel=args.sam_dilation,
+                consistency_iou_threshold=args.sam_iou_threshold,
             )
         print(f"SAM{args.sam_version[-1]} refiner loaded.")
 
