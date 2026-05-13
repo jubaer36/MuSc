@@ -15,3 +15,4 @@ dinov3_vitl16_submission_folder.tar.gz
 models/sam_vit_h.pth
 dinov3_vitl16_sam_submission_folder/
 old_submission_folder.tar.gz
+models/sam3/*

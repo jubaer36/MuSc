@@ -19,8 +19,13 @@ testing:
 
 sam:
   use_sam: False
+  version: 'sam1'          # 'sam1' or 'sam3'
+  # SAM1 settings (used when version: sam1)
   checkpoint: 'models/sam_vit_h.pth'
   model_type: 'vit_h'
+  # SAM3 settings (used when version: sam3)
+  sam3_model_id: 'models/sam3'
+  # Shared settings
   k_pos: 5
   k_neg: 5
   min_spacing_px: 30

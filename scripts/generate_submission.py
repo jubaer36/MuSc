@@ -461,8 +461,17 @@ def main():
                         help="Default: ./output/mvtec_ad2/{backbone_short}")
     parser.add_argument("--use_sam",         action="store_true", default=False,
                         help="Enable SAM cascaded prompt refinement for segmentation.")
-    parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth")
-    parser.add_argument("--sam_model_type",  default="vit_h")
+    parser.add_argument("--sam_version",     default="sam1", choices=["sam1", "sam3"],
+                        help="SAM backend: 'sam1' (segment_anything) or 'sam3' (Sam3TrackerModel).")
+    # SAM1 args
+    parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth",
+                        help="SAM1 checkpoint path (used when --sam_version sam1).")
+    parser.add_argument("--sam_model_type",  default="vit_h",
+                        help="SAM1 model type: vit_h | vit_l | vit_b.")
+    # SAM3 args
+    parser.add_argument("--sam3_model_id",   default="models/sam3",
+                        help="SAM3 HuggingFace model ID or local path (used when --sam_version sam3).")
+    # Shared args
     parser.add_argument("--sam_k_pos",       type=int, default=5)
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=30)
@@ -491,17 +500,29 @@ def main():
 
     sam_refiner = None
     if args.use_sam:
-        from models.sam_refiner import SAMRefiner
-        sam_refiner = SAMRefiner(
-            checkpoint_path=args.sam_checkpoint,
-            model_type=args.sam_model_type,
-            device=str(device),
-            k_pos=args.sam_k_pos,
-            k_neg=args.sam_k_neg,
-            min_spacing_px=args.sam_spacing,
-            dilation_kernel=args.sam_dilation,
-        )
-        print("SAM refiner loaded.")
+        from models.sam_refiner import create_sam_refiner
+        if args.sam_version == "sam1":
+            sam_refiner = create_sam_refiner(
+                "sam1",
+                checkpoint_path=args.sam_checkpoint,
+                model_type=args.sam_model_type,
+                device=str(device),
+                k_pos=args.sam_k_pos,
+                k_neg=args.sam_k_neg,
+                min_spacing_px=args.sam_spacing,
+                dilation_kernel=args.sam_dilation,
+            )
+        else:
+            sam_refiner = create_sam_refiner(
+                "sam3",
+                model_id=args.sam3_model_id,
+                device=str(device),
+                k_pos=args.sam_k_pos,
+                k_neg=args.sam_k_neg,
+                min_spacing_px=args.sam_spacing,
+                dilation_kernel=args.sam_dilation,
+            )
+        print(f"SAM{args.sam_version[-1]} refiner loaded.")
 
     if args.threshold is None:
         threshold = compute_threshold_from_public(
