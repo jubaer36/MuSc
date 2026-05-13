@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=60)
     parser.add_argument("--sam_dilation",    type=int, default=15)
+    parser.add_argument("--gamma_tta",       action="store_true", default=False,
+                        help="Run TTA with gamma=0.8 and gamma=1.3 variants, fuse 0.6/0.2/0.2.")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -135,17 +137,43 @@ def main():
             print("  No images.")
             continue
 
-        anomaly_maps, image_paths, gt_masks = run_inference(
-            dataset=dataset,
-            model=model,
-            backbone_type=backbone_type,
-            features_list=features_list,
-            r_list=args.r_list,
-            device=device,
-            batch_size=args.batch_size,
-            image_size=args.img_resize,
-            with_masks=True,
-        )
+        if args.gamma_tta:
+            from utils.gamma_tta import GammaPreprocess, fuse_gamma_heatmaps
+
+            def _make_ds(gamma):
+                pp = GammaPreprocess(preprocess, gamma) if gamma != 1.0 else preprocess
+                return mvtec_ad2.MVTecAD2Dataset(
+                    source=args.data_path, classname=category,
+                    split=mvtec_ad2.DatasetSplit.TEST,
+                    resize=args.img_resize, imagesize=args.img_resize,
+                    clip_transformer=pp,
+                )
+
+            _inf_kwargs = dict(
+                model=model, backbone_type=backbone_type,
+                features_list=features_list, r_list=args.r_list,
+                device=device, batch_size=args.batch_size,
+                image_size=args.img_resize,
+            )
+            maps_o, image_paths, gt_masks = run_inference(
+                dataset=_make_ds(1.0), with_masks=True, **_inf_kwargs
+            )
+            maps_b, _ = run_inference(dataset=_make_ds(0.8), **_inf_kwargs)
+            maps_d, _ = run_inference(dataset=_make_ds(1.3), **_inf_kwargs)
+            anomaly_maps = fuse_gamma_heatmaps([maps_o, maps_b, maps_d])
+            del maps_o, maps_b, maps_d
+        else:
+            anomaly_maps, image_paths, gt_masks = run_inference(
+                dataset=dataset,
+                model=model,
+                backbone_type=backbone_type,
+                features_list=features_list,
+                r_list=args.r_list,
+                device=device,
+                batch_size=args.batch_size,
+                image_size=args.img_resize,
+                with_masks=True,
+            )
 
         if gt_masks is None or gt_masks.sum() == 0:
             print("  No GT mask pixels — skipping.")
