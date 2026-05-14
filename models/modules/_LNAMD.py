@@ -62,18 +62,20 @@ class MeanMapper(torch.nn.Module):
 
 
 class LNAMD(torch.nn.Module):
-    def __init__(self, device, feature_dim=1024, feature_layer=[1,2,3,4], r=3, patchstride=1):
+    def __init__(self, device, feature_dim=1024, feature_layer=[1,2,3,4], r=3, patchstride=1,
+                 ffe_adapters=None):
         super(LNAMD, self).__init__()
         self.device = device
         self.r = r
         self.patch_maker = PatchMaker(r, stride=patchstride)
         self.LNA = Preprocessing(feature_layer, feature_dim)
+        self.ffe_adapters = ffe_adapters   # nn.ModuleList of FFEAdapter, or None
 
     def _embed(self, features):
         B = features[0].shape[0]
 
         features_layers = []
-        for feature in features:
+        for i, feature in enumerate(features):
             # reshape and layer normalization
             feature = feature[:, 1:, :] # remove the cls token
             feature = feature.reshape(feature.shape[0],
@@ -83,6 +85,8 @@ class LNAMD(torch.nn.Module):
             feature = feature.permute(0, 3, 1, 2)
             feature = torch.nn.LayerNorm([feature.shape[1], feature.shape[2],
                                           feature.shape[3]]).to(self.device)(feature)
+            if self.ffe_adapters is not None:
+                feature = self.ffe_adapters[i](feature)
             features_layers.append(feature)
 
         if self.r != 1:

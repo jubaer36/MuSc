@@ -10,6 +10,7 @@ Does NOT regenerate private-split submission files.
 """
 
 import argparse
+import datetime
 import gc
 import os
 import sys
@@ -67,7 +68,16 @@ def main():
     parser.add_argument("--sam_dilation",    type=int, default=15)
     parser.add_argument("--sam_iou_threshold", type=float, default=0.4,
                         help="IoU gate: use M2 instead of M3 when IoU(M2,M3) < this value.")
+    parser.add_argument("--log_file", default=None,
+                        help="Results log path. Default: logs/segf1_<timestamp>.log")
     args = parser.parse_args()
+
+    os.makedirs("logs", exist_ok=True)
+    if args.log_file is None:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.log_file = f"logs/segf1_{ts}.log"
+    log_fh = open(args.log_file, "w", buffering=1)
+    print(f"Logging results to: {args.log_file}")
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
@@ -214,15 +224,20 @@ def main():
             f"{category:14s}  {global_thr:>10.6f}  {segf1_g*100:>11.2f}%"
             f"  {cat_thr:>11.6f}  {segf1_c*100:>8.2f}%"
         )
+        log_fh.write(f"{category}: segF1@cls={segf1_c*100:.2f}%  thr={cat_thr:.6f}\n")
+        log_fh.flush()
 
     n = len(segf1_global_ls)
     if n > 0:
+        global_mean = sum(segf1_cls_ls) / n * 100
         print("-" * 60)
         print(
             f"{'mean':14s}  {global_thr:>10.6f}  {sum(segf1_global_ls)/n*100:>11.2f}%"
-            f"  {'(per-cls)':>11s}  {sum(segf1_cls_ls)/n*100:>8.2f}%"
+            f"  {'(per-cls)':>11s}  {global_mean:>8.2f}%"
         )
+        log_fh.write(f"global_mean_segF1@cls={global_mean:.2f}%\n")
 
+    log_fh.close()
     print("\nDone.")
 
 

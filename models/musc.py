@@ -94,6 +94,36 @@ class MuSc():
             # clip
             self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(self.model_name, self.image_size, pretrained=self.pretrained)
             self.clip_model.to(self.device)
+        self.ffe_adapters = self._load_ffe_adapters()
+
+    def _load_ffe_adapters(self):
+        """Load pretrained FFE adapter weights. Returns frozen nn.ModuleList or None."""
+        ffe_cfg = self.cfg.get('ffe_adapter', {})
+        if not ffe_cfg.get('enabled', False):
+            return None
+
+        from models.modules.ffe_adapter import FFEAdapter
+
+        ckpt_dir  = ffe_cfg['checkpoint_dir']
+        lam       = ffe_cfg.get('lam', 0.5)
+        win_size  = ffe_cfg.get('window_size', 3)
+        embed_dim = ffe_cfg.get('embed_dim', 1024)
+        n_layers  = len(self.features_list)
+
+        adapters = torch.nn.ModuleList()
+        for i in range(n_layers):
+            adapter = FFEAdapter(embed_dim=embed_dim, window_size=win_size, lam=lam)
+            ckpt_path = os.path.join(ckpt_dir, f"ffe_layer_{i}.pt")
+            state = torch.load(ckpt_path, map_location=self.device)
+            adapter.linear.load_state_dict(state)
+            adapter.eval()
+            for p in adapter.parameters():
+                p.requires_grad_(False)
+            adapters.append(adapter)
+
+        adapters.to(self.device)
+        print(f"FFE adapters loaded ({n_layers} layers, lam={lam}) from {ckpt_dir}")
+        return adapters
 
 
     def load_datasets(self, category, divide_num=1, divide_iter=0):
@@ -210,7 +240,9 @@ class MuSc():
             for r in self.r_list:
                 start_time = time.time()
                 print('aggregation degree: {}'.format(r))
-                LNAMD_r = LNAMD(device=self.device, r=r, feature_dim=feature_dim, feature_layer=self.features_list)
+                LNAMD_r = LNAMD(device=self.device, r=r, feature_dim=feature_dim,
+                                feature_layer=self.features_list,
+                                ffe_adapters=self.ffe_adapters)
                 Z_layers = {}
                 for im in range(len(patch_tokens_list)):
                     patch_tokens = [p.to(self.device) for p in patch_tokens_list[im]]

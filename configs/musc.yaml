@@ -17,6 +17,13 @@ testing:
   vis_type: single_norm # choice ['single_norm', 'whole_norm']
   save_excel: False
 
+ffe_adapter:
+  enabled: false                      # flip to true after training completes
+  checkpoint_dir: ./checkpoints/ffe   # directory containing ffe_layer_0..3.pt
+  window_size: 3                      # must match --window_size used in training
+  lam: 0.5                            # residual mix: 0.0=off, 1.0=full adapter
+  embed_dim: 1024                     # must match backbone embed_dim
+
 sam:
   use_sam: False
   version: 'sam1'          # 'sam1' or 'sam3'
