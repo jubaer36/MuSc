@@ -39,7 +39,7 @@ import models.backbone._backbones as _backbones
 from models.backbone.dinov3_backbone import load_dinov3
 from models.modules._LNAMD import LNAMD, SNAMD
 from models.modules._MSM import MSM
-from utils.metrics import compute_metrics, find_best_threshold, compute_segf1_at_threshold
+from utils.metrics import find_best_threshold, compute_segf1_at_threshold
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -259,9 +259,9 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
     print("Phase 1: computing threshold from test_public")
     print("=" * 60)
 
-    auroc_sp_ls, f1_sp_ls, ap_sp_ls = [], [], []
-    auroc_px_ls, f1_px_ls, ap_px_ls, aupro_ls = [], [], [], []
+    thr_cat_ls, segf1_cat_ls = [], []
     pr_samples, gt_samples = [], []
+    stored_maps = {}  # category -> (pr_px, gt_px) for global-threshold eval
     valid_cats = []
 
     for category in args.classes:
@@ -321,27 +321,21 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
             )
 
         gt_px = gt_masks.astype(np.int32) if gt_masks is not None else None
-        pr_sp = anomaly_maps.reshape(len(anomaly_maps), -1).max(-1)
-        gt_sp = (
-            (gt_px.reshape(len(gt_px), -1).max(-1) > 0).astype(np.int32)
-            if gt_px is not None else None
-        )
 
-        # Metrics computed on raw float heatmaps (before SAM) for valid AUROC/AUPRO
-        image_metric, pixel_metric = compute_metrics(gt_sp, pr_sp, gt_px, anomaly_maps)
-        auroc_sp, f1_sp, ap_sp = image_metric
-        auroc_px, f1_px, ap_px, aupro = pixel_metric
-
-        auroc_sp_ls.append(auroc_sp); f1_sp_ls.append(f1_sp); ap_sp_ls.append(ap_sp)
-        auroc_px_ls.append(auroc_px); f1_px_ls.append(f1_px)
-        ap_px_ls.append(ap_px);       aupro_ls.append(aupro)
-        valid_cats.append(category)
-
-        # SAM refinement for threshold computation only
         if sam_refiner is not None:
             anomaly_maps = sam_refine_maps(anomaly_maps, image_paths, sam_refiner, args.img_resize)
 
         pr_px = anomaly_maps
+
+        # per-class best threshold and SegF1
+        thr_cat = find_best_threshold(gt_px.ravel(), pr_px.ravel())
+        segf1_cat = compute_segf1_at_threshold(gt_px, pr_px, thr_cat)
+        thr_cat_ls.append(thr_cat)
+        segf1_cat_ls.append(segf1_cat)
+        stored_maps[category] = (pr_px.copy(), gt_px.copy())
+        valid_cats.append(category)
+
+        # sample pixels for global threshold computation
         n_px = pr_px.ravel().shape[0]
         n_samp = min(150_000, n_px)
         rng = np.random.default_rng(42)
@@ -365,23 +359,26 @@ def compute_threshold_from_public(args, model, preprocess, backbone_type, device
     threshold = find_best_threshold(combined_gt, combined_pr)
     del combined_pr, combined_gt, pr_samples, gt_samples
 
+    # per-class SegF1 at global threshold
+    segf1_global_ls = []
+    for cat in valid_cats:
+        pr_map, gt_map = stored_maps[cat]
+        segf1_global_ls.append(compute_segf1_at_threshold(gt_map, pr_map, threshold))
+    del stored_maps
+
+    # print results table
+    n = len(valid_cats)
     print(f"\n  Global threshold: {threshold:.6f}")
-    print("\n  Per-category metrics (test_public):")
+    print(f"\n  {'category':12s}  {'class_thr':>10s}  {'segF1@class_thr':>15s}  {'segF1@global_thr':>16s}")
+    print(f"  {'-'*12}  {'-'*10}  {'-'*15}  {'-'*16}")
     for i, cat in enumerate(valid_cats):
         print(
-            f"  {cat:12s}  "
-            f"auroc_px:{auroc_px_ls[i]*100:.1f}  f1_max:{f1_px_ls[i]*100:.1f}  "
-            f"ap:{ap_px_ls[i]*100:.1f}  aupro:{aupro_ls[i]*100:.1f}  "
-            f"auroc_sp:{auroc_sp_ls[i]*100:.1f}  f1_sp:{f1_sp_ls[i]*100:.1f}"
+            f"  {cat:12s}  {thr_cat_ls[i]:>10.6f}  {segf1_cat_ls[i]*100:>14.1f}%  {segf1_global_ls[i]*100:>15.1f}%"
         )
-    n = len(valid_cats)
     if n > 0:
-        print(
-            f"  {chr(39)+'mean'+chr(39):12s}  "
-            f"auroc_px:{sum(auroc_px_ls)/n*100:.1f}  f1_max:{sum(f1_px_ls)/n*100:.1f}  "
-            f"ap:{sum(ap_px_ls)/n*100:.1f}  aupro:{sum(aupro_ls)/n*100:.1f}  "
-            f"auroc_sp:{sum(auroc_sp_ls)/n*100:.1f}  f1_sp:{sum(f1_sp_ls)/n*100:.1f}"
-        )
+        mean_cat   = sum(segf1_cat_ls) / n * 100
+        mean_global = sum(segf1_global_ls) / n * 100
+        print(f"  {'mean':12s}  {'':>10s}  {mean_cat:>14.1f}%  {mean_global:>15.1f}%")
 
     return threshold
 
