@@ -19,21 +19,6 @@ import numpy as np
 import torch
 
 
-class _Tee:
-    """Write to both stream and file simultaneously."""
-    def __init__(self, stream, fh):
-        self._stream = stream
-        self._fh = fh
-    def write(self, data):
-        self._stream.write(data)
-        self._fh.write(data)
-    def flush(self):
-        self._stream.flush()
-        self._fh.flush()
-    def fileno(self):
-        return self._stream.fileno()
-    def isatty(self):
-        return self._stream.isatty()
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
@@ -91,15 +76,19 @@ def main():
                         help="Path to log file. Default: logs/segf1_<timestamp>.log")
     args = parser.parse_args()
 
-    # Set up logging to file + terminal
+    # Set up results log (results only, not all output)
     if args.log_file is None:
         os.makedirs("logs", exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.log_file = f"logs/segf1_{ts}.log"
     log_fh = open(args.log_file, "w", buffering=1)
-    sys.stdout = _Tee(sys.__stdout__, log_fh)
-    sys.stderr = _Tee(sys.__stderr__, log_fh)
-    print(f"Logging to: {args.log_file}")
+
+    def log_result(msg=""):
+        print(msg)
+        log_fh.write(msg + "\n")
+        log_fh.flush()
+
+    print(f"Logging results to: {args.log_file}")
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
@@ -240,12 +229,12 @@ def main():
     combined_pr = np.concatenate(pr_samps)
     combined_gt = np.concatenate(gt_samps)
     global_thr  = find_best_threshold(combined_gt, combined_pr)
-    print(f"\nGlobal threshold (combined test_public): {global_thr:.6f}")
+    log_result(f"\nGlobal threshold (combined test_public): {global_thr:.6f}")
 
     # --- Report table ---
-    print("\n" + "=" * 60)
-    print(f"{'Category':14s}  {'Global thr':>10s}  {'segF1@global':>12s}  {'Per-cls thr':>11s}  {'segF1@cls':>9s}")
-    print("=" * 60)
+    log_result("\n" + "=" * 60)
+    log_result(f"{'Category':14s}  {'Global thr':>10s}  {'segF1@global':>12s}  {'Per-cls thr':>11s}  {'segF1@cls':>9s}")
+    log_result("=" * 60)
 
     segf1_global_ls = []
     segf1_cls_ls    = []
@@ -253,7 +242,7 @@ def main():
 
     for category in args.classes:
         if category not in cat_maps:
-            print(f"{'  '+category:14s}  (skipped)")
+            log_result(f"{'  '+category:14s}  (skipped)")
             continue
 
         pr_px = cat_maps[category]
@@ -268,20 +257,20 @@ def main():
         segf1_cls_ls.append(segf1_c)
         cls_thr_ls.append(cat_thr)
 
-        print(
+        log_result(
             f"{category:14s}  {global_thr:>10.6f}  {segf1_g*100:>11.2f}%"
             f"  {cat_thr:>11.6f}  {segf1_c*100:>8.2f}%"
         )
 
     n = len(segf1_global_ls)
     if n > 0:
-        print("-" * 60)
-        print(
+        log_result("-" * 60)
+        log_result(
             f"{'mean':14s}  {global_thr:>10.6f}  {sum(segf1_global_ls)/n*100:>11.2f}%"
             f"  {'(per-cls)':>11s}  {sum(segf1_cls_ls)/n*100:>8.2f}%"
         )
 
-    print("\nDone.")
+    log_result("\nDone.")
     log_fh.close()
 
 
