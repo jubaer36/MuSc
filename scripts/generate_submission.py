@@ -217,7 +217,7 @@ def run_inference(
     print("  MSM ...")
     maps_per_layer = []
     for l_key in sorted(Z_layers.keys()):
-        Z = torch.cat(Z_layers[l_key], dim=0).to(device)  # (N, P, 3C)
+        Z = torch.cat(Z_layers[l_key], dim=0).to(device)  # (N, P, 3C) float16 on GPU
         del Z_layers[l_key]
         torch.cuda.empty_cache()
         print(f"    layer-{l_key} ({Z.shape[0]} imgs, feat_dim={Z.shape[-1]}) ...")
@@ -495,6 +495,8 @@ def main():
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=60)
     parser.add_argument("--sam_dilation",    type=int, default=15)
+    parser.add_argument("--sam_iou_threshold", type=float, default=0.4,
+                        help="IoU gate: use M2 instead of M3 when IoU(M2,M3) < this value.")
     parser.add_argument("--gamma_tta",        action="store_true", default=False,
                         help="Run TTA with gamma=0.8 and gamma=1.3 variants, fuse 0.6/0.2/0.2.")
 
@@ -532,6 +534,7 @@ def main():
                 k_neg=args.sam_k_neg,
                 min_spacing_px=args.sam_spacing,
                 dilation_kernel=args.sam_dilation,
+                consistency_iou_threshold=args.sam_iou_threshold,
             )
         else:
             sam_refiner = create_sam_refiner(
@@ -542,6 +545,7 @@ def main():
                 k_neg=args.sam_k_neg,
                 min_spacing_px=args.sam_spacing,
                 dilation_kernel=args.sam_dilation,
+                consistency_iou_threshold=args.sam_iou_threshold,
             )
         print(f"SAM{args.sam_version[-1]} refiner loaded.")
 

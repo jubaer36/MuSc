@@ -229,7 +229,7 @@ class MuSc():
             anomaly_maps_l = torch.tensor([]).double()
             start_time = time.time()
             for l in sorted(Z_layers.keys()):
-                Z = torch.cat(Z_layers[l], dim=0).to(self.device)  # (N, P, 3C)
+                Z = torch.cat(Z_layers[l], dim=0).to(self.device)  # (N, P, 3C) float16 on GPU
                 print('layer-{} mutual scoring (feat_dim={})...'.format(l, Z.shape[-1]))
                 anomaly_maps_msm = MSM(Z=Z, device=self.device, topmin_min=0, topmin_max=0.3)
                 anomaly_maps_l = torch.cat(
