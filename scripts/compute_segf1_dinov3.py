@@ -10,6 +10,7 @@ Does NOT regenerate private-split submission files.
 """
 
 import argparse
+import datetime
 import gc
 import os
 import sys
@@ -70,6 +71,8 @@ def main():
     # Dual-backbone ensemble
     parser.add_argument("--dual_backbone",    action="store_true", default=False,
                         help="Run CLIP ViT-L alongside DINOv3 for dual-model SAM prompts.")
+    parser.add_argument("--fusion",           default="max", choices=["max", "geometric_mean"],
+                        help="Map fusion strategy when --dual_backbone: 'max' or 'geometric_mean'.")
     parser.add_argument("--clip_model_name",  default="ViT-L-14-336",
                         help="CLIP model name for secondary backbone.")
     parser.add_argument("--clip_pretrained",  default="openai")
@@ -78,6 +81,8 @@ def main():
                         help="CLIP feature layer indices.")
     parser.add_argument("--output_tag",       default=None,
                         help="Tag appended to result filenames (e.g. 'ensemble').")
+    parser.add_argument("--log_dir",          default="./logs",
+                        help="Directory to save result log files.")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -100,7 +105,8 @@ def main():
             args.clip_model_name, args.clip_img_size, pretrained=args.clip_pretrained
         )
         clip_model_secondary.to(device).eval()
-        print(f"  CLIP layers: {args.clip_features}")
+        clip_features_list = [l + 1 for l in args.clip_features]
+        print(f"  CLIP layers: {clip_features_list}")
 
     sam_refiner = None
     if args.use_sam:
@@ -190,7 +196,7 @@ def main():
                     dataset=dataset_clip,
                     model=clip_model_secondary,
                     backbone_type="clip",
-                    features_list=args.clip_features,
+                    features_list=clip_features_list,
                     r_list=args.r_list,
                     device=device,
                     batch_size=args.batch_size,
@@ -202,6 +208,7 @@ def main():
                 anomaly_maps = sam_refine_maps_ensemble(
                     anomaly_maps, anomaly_maps_clip,
                     image_paths, sam_refiner, args.img_resize,
+                    fusion=args.fusion,
                 )
                 del anomaly_maps_clip
             else:
@@ -271,6 +278,63 @@ def main():
             f"{'mean':14s}  {global_thr:>10.6f}  {sum(segf1_global_ls)/n*100:>11.2f}%"
             f"  {'(per-cls)':>11s}  {sum(segf1_cls_ls)/n*100:>8.2f}%"
         )
+
+    # --- Save results to log file ---
+    os.makedirs(args.log_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = f"_{args.output_tag}" if args.output_tag else ""
+    log_path = os.path.join(args.log_dir, f"segf1_dinov3{tag}_{ts}.log")
+
+    with open(log_path, "w") as f:
+        f.write(f"Run: {ts}\n")
+        f.write("=" * 60 + "\n")
+
+        f.write("\n[Model]\n")
+        f.write(f"  backbone      : {args.backbone_name}\n")
+        f.write(f"  pretrained    : {args.pretrained}\n")
+        f.write(f"  img_resize    : {args.img_resize}\n")
+        f.write(f"  feature_layers: {args.feature_layers}\n")
+        f.write(f"  r_list        : {args.r_list}\n")
+
+        f.write("\n[SAM]\n")
+        f.write(f"  use_sam       : {args.use_sam}\n")
+        if args.use_sam:
+            f.write(f"  sam_version   : {args.sam_version}\n")
+            if args.sam_version == "sam1":
+                f.write(f"  sam_checkpoint: {args.sam_checkpoint}\n")
+                f.write(f"  sam_model_type: {args.sam_model_type}\n")
+            else:
+                f.write(f"  sam3_model_id : {args.sam3_model_id}\n")
+            f.write(f"  sam_k_pos     : {args.sam_k_pos}\n")
+            f.write(f"  sam_k_neg     : {args.sam_k_neg}\n")
+            f.write(f"  sam_spacing   : {args.sam_spacing}\n")
+            f.write(f"  sam_dilation  : {args.sam_dilation}\n")
+
+        f.write("\n[Ensemble]\n")
+        f.write(f"  dual_backbone : {args.dual_backbone}\n")
+        if args.dual_backbone:
+            f.write(f"  clip_model    : {args.clip_model_name} ({args.clip_pretrained})\n")
+            f.write(f"  clip_img_size : {args.clip_img_size}\n")
+            f.write(f"  clip_features : {args.clip_features}\n")
+            f.write(f"  fusion        : {args.fusion}\n")
+
+        f.write("\n[Results]\n")
+        f.write(f"  global_threshold: {global_thr:.6f}\n\n")
+        f.write(f"  {'Category':14s}  {'Global thr':>10s}  {'segF1@global':>12s}  {'Per-cls thr':>11s}  {'segF1@cls':>9s}\n")
+        f.write("  " + "-" * 62 + "\n")
+        for i, category in enumerate(c for c in args.classes if c in cat_maps):
+            f.write(
+                f"  {category:14s}  {global_thr:>10.6f}  {segf1_global_ls[i]*100:>11.2f}%"
+                f"  {cls_thr_ls[i]:>11.6f}  {segf1_cls_ls[i]*100:>8.2f}%\n"
+            )
+        if n > 0:
+            f.write("  " + "-" * 62 + "\n")
+            f.write(
+                f"  {'mean':14s}  {global_thr:>10.6f}  {sum(segf1_global_ls)/n*100:>11.2f}%"
+                f"  {'(per-cls)':>11s}  {sum(segf1_cls_ls)/n*100:>8.2f}%\n"
+            )
+
+    print(f"\nLog saved: {log_path}")
 
     print("\nDone.")
 

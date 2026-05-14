@@ -69,31 +69,63 @@ All cases print diagnostic messages — no silent failures.
 
 ---
 
+## Fusion Strategy
+
+After inference, both DINOv3 and CLIP maps are normalized independently to `[0,1]` per image (min-max), then fused before SAM gating.
+
+| `--fusion` | Formula | Behavior |
+|------------|---------|----------|
+| `max` (default) | `max(H_dino_n, H_clip_n)` | Flags anomaly if EITHER model fires. Higher recall, may raise FP. |
+| `geometric_mean` | `sqrt(H_dino_n × H_clip_n)` | Flags anomaly only where BOTH models agree. Lower FP, may miss weak anomalies. |
+
+SAM fallback (empty mask): returns fused map directly (not raw DINOv3 only).
+
+---
+
 ## Run Commands
 
 ```bash
-# Single-model (regression, behavior unchanged)
+# Single-model baseline (no ensemble)
 conda run -n clip python3 scripts/compute_segf1_dinov3.py \
     --backbone_name facebook/dinov3-vitl16-pretrain-lvd1689m \
     --data_path ./data/mvtec_ad_2/ --img_resize 512 \
     --use_sam --sam_version sam3 --sam3_model_id models/sam3
 
-# Ensemble: DINOv3 + CLIP dual-model SAM prompts
+# Ensemble — max fusion (default, higher recall)
 conda run -n clip python3 scripts/compute_segf1_dinov3.py \
     --backbone_name facebook/dinov3-vitl16-pretrain-lvd1689m \
     --data_path ./data/mvtec_ad_2/ --img_resize 512 \
     --use_sam --sam_version sam3 --sam3_model_id models/sam3 \
-    --dual_backbone
+    --dual_backbone --fusion max \
+    --output_tag ensemble_max
 
-# Submission generation (ensemble)
+# Ensemble — geometric mean fusion (stricter, lower FP)
+conda run -n clip python3 scripts/compute_segf1_dinov3.py \
+    --backbone_name facebook/dinov3-vitl16-pretrain-lvd1689m \
+    --data_path ./data/mvtec_ad_2/ --img_resize 512 \
+    --use_sam --sam_version sam3 --sam3_model_id models/sam3 \
+    --dual_backbone --fusion geometric_mean \
+    --output_tag ensemble_geomean
+
+# Submission generation — max fusion
 conda run -n clip python3 scripts/generate_submission.py \
     --backbone_name facebook/dinov3-vitl16-pretrain-lvd1689m \
     --data_path ./data/mvtec_ad_2/ --img_resize 512 \
     --use_sam --sam_version sam3 --sam3_model_id models/sam3 \
-    --dual_backbone
+    --dual_backbone --fusion max \
+    --output_tag ensemble_max
+
+# Submission generation — geometric mean fusion
+conda run -n clip python3 scripts/generate_submission.py \
+    --backbone_name facebook/dinov3-vitl16-pretrain-lvd1689m \
+    --data_path ./data/mvtec_ad_2/ --img_resize 512 \
+    --use_sam --sam_version sam3 --sam3_model_id models/sam3 \
+    --dual_backbone --fusion geometric_mean \
+    --output_tag ensemble_geomean
 ```
 
-Expected: SAM3 logs show `[dual]` prefix messages per image — R1/R2 coverage, R_pos coverage, point counts.  
+Expected: SAM3 logs show `[dual]` prefix messages per image — R1/R2 coverage, R_pos coverage, point counts, fusion mode.  
+Results saved to `./logs/segf1_dinov3_{output_tag}_{timestamp}.log`.  
 AUROC-cls unchanged (RsCIN pathway untouched).
 
 ---
@@ -101,6 +133,14 @@ AUROC-cls unchanged (RsCIN pathway untouched).
 ## What Not Changed
 
 - SAM 3-pass cascade (pass1: points, pass2: points+logit, pass3: points+box+logit) — unchanged
-- Output handling after SAM (`hmap * m3`) — unchanged
 - RsCIN classification pathway — unchanged
 - Single-model path (no `--dual_backbone`) — fully backward compatible
+
+## What Changed (bug fixes applied)
+
+| Issue | Fix |
+|-------|-----|
+| CLIP map discarded from output (only used for SAM prompts) | Now normalized + fused with DINO map before SAM gating |
+| SAM fallback returned raw `H_dino` only | Fallback now returns fused map |
+| No normalization before fusion (scale mismatch) | `_minmax_norm` applied per image to each map independently |
+| CLIP feature layer indices not +1 converted (off by one layer) | `clip_features_list = [l+1 for l in args.clip_features]` in both scripts |

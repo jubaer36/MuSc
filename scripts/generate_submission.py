@@ -392,16 +392,30 @@ def save_maps(anomaly_maps, image_paths, category, split, submission_dir, thresh
     print(f"    saved {len(anomaly_maps)} maps -> {tiff_dir}")
 
 
+def _minmax_norm(h):
+    lo, hi = float(h.min()), float(h.max())
+    return (h - lo) / (hi - lo + 1e-8)
+
+
+def _fuse_maps(h1_n, h2_n, fusion):
+    if fusion == "max":
+        return np.maximum(h1_n, h2_n)
+    elif fusion == "geometric_mean":
+        return np.sqrt(h1_n * h2_n)
+    else:
+        raise ValueError(f"Unknown fusion mode: {fusion!r}. Choose 'max' or 'geometric_mean'.")
+
+
 def sam_refine_maps_ensemble(
     anomaly_maps_primary, anomaly_maps_secondary,
-    image_paths, sam_refiner, image_size,
+    image_paths, sam_refiner, image_size, fusion="max",
 ):
-    """Dual-model SAM refinement using intersection/union prompt strategy.
+    """Dual-model SAM refinement with normalized map fusion.
 
-    Passes both primary (DINOv3) and secondary (CLIP) heatmaps to sam_refiner.refine()
-    so that _build_dual_point_arrays() selects pos from R_dino ∩ R_clip and
-    neg ring from outside R_dino ∪ R_clip. Output handling is identical to
-    sam_refine_maps (hmap_primary * m3 gating).
+    Both primary (DINOv3) and secondary (CLIP) heatmaps are:
+      1. Min-max normalized per image to [0,1] to remove scale bias.
+      2. Fused via 'fusion' strategy (max or geometric_mean).
+      3. SAM-gated using dual-prompt mask (R_dino ∩ R_clip for pos points).
 
     Args:
         anomaly_maps_primary:   (N, 1, H, W) float32 — DINOv3 heatmaps
@@ -409,6 +423,7 @@ def sam_refine_maps_ensemble(
         image_paths:  list of str, length N
         sam_refiner:  SAMRefiner or SAM3Refiner instance
         image_size:   int, resize resolution for loading source images
+        fusion:       str, 'max' or 'geometric_mean'
 
     Returns:
         (N, 1, H, W) float32 numpy
@@ -430,13 +445,18 @@ def sam_refine_maps_ensemble(
         )
         hmap1 = amap1.squeeze()
         hmap2 = amap2.squeeze()
+
+        h1_n = _minmax_norm(hmap1)
+        h2_n = _minmax_norm(hmap2)
+        fused = _fuse_maps(h1_n, h2_n, fusion)
+
         m3 = sam_refiner.refine(img_np, hmap1, hmap2)
         if m3.sum() == 0:
-            print(f"  [ensemble] SAM empty mask — keeping raw primary heatmap")
-            refined_map = hmap1
+            print(f"  [ensemble] SAM empty mask — keeping fused heatmap")
+            refined_map = fused
         else:
-            refined_map = hmap1 * m3.astype(np.float32)
-            print(f"  [ensemble] SAM mask coverage={m3.mean():.4f}")
+            refined_map = fused * m3.astype(np.float32)
+            print(f"  [ensemble] SAM mask coverage={m3.mean():.4f}  fusion={fusion}")
         refined.append(refined_map.astype(np.float32)[np.newaxis])
     return np.stack(refined, axis=0)
 
@@ -514,6 +534,8 @@ def main():
     # Dual-backbone ensemble args
     parser.add_argument("--dual_backbone",    action="store_true", default=False,
                         help="Run CLIP ViT-L alongside DINOv3 for dual-model SAM prompts.")
+    parser.add_argument("--fusion",           default="max", choices=["max", "geometric_mean"],
+                        help="Map fusion strategy when --dual_backbone: 'max' or 'geometric_mean'.")
     parser.add_argument("--clip_model_name",  default="ViT-L-14-336",
                         help="CLIP model name for secondary backbone (dual mode).")
     parser.add_argument("--clip_pretrained",  default="openai",
@@ -576,7 +598,7 @@ def main():
             args.clip_model_name, args.clip_img_size, pretrained=args.clip_pretrained
         )
         clip_model_secondary.to(device).eval()
-        clip_features_list = args.clip_features
+        clip_features_list = [l + 1 for l in args.clip_features]
         print(f"  CLIP layers: {clip_features_list}")
 
     sam_refiner = None
@@ -666,6 +688,7 @@ def main():
                     anomaly_maps = sam_refine_maps_ensemble(
                         anomaly_maps, anomaly_maps_clip,
                         image_paths, sam_refiner, args.img_resize,
+                        fusion=args.fusion,
                     )
                     del anomaly_maps_clip
                 else:
