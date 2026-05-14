@@ -258,15 +258,17 @@ class SNAMD(torch.nn.Module):
         """Multi-scale SNAMD embed.
 
         Runs _embed_single_r for each r in r_list, concatenates on the feature
-        dimension, and L2-normalizes the concatenated 3C vector.
+        dimension, and L2-normalizes the concatenated R*C vector.
 
-        Returns: (B, P, L, len(r_list)*C) CPU tensor, unit-normed on last dim.
+        Returns: (B, P, L, len(r_list)*C) float16 CPU tensor, unit-normed on last dim.
         Callers must NOT apply additional .norm() normalization.
+        float16 is forced explicitly to prevent CPU from silently upcasting norm ops
+        to float32, which would triple CPU RAM and GPU VRAM usage.
         """
         agg_per_r = [self._embed_single_r(features, r) for r in self.r_list]
-        combined = torch.cat(agg_per_r, dim=-1)             # (B, P, L, R*C)
+        combined = torch.cat(agg_per_r, dim=-1).float()     # (B, P, L, R*C) — float32 for stable norm
         combined = combined / combined.norm(dim=-1, keepdim=True)
-        return combined
+        return combined.half()                               # back to float16: 3C dims, 2 bytes/elem
 
 
 if __name__ == "__main__":
