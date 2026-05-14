@@ -6,6 +6,39 @@ from skimage import measure
 class _SAMRefinerBase:
     """Shared prompt-generation helpers for all SAM backend variants."""
 
+    def _robust_normalize(self, heatmap):
+        """Median-MAD normalization followed by min-max rescale to [0, 1].
+
+        More stable than plain min-max under lighting/exposure shifts because
+        outlier pixels don't compress the useful score range.
+        """
+        eps = 1e-8
+        med = float(np.median(heatmap))
+        mad = float(np.median(np.abs(heatmap - med))) + eps
+        a = (heatmap - med) / mad
+        a_min, a_max = float(a.min()), float(a.max())
+        if a_max - a_min < eps:
+            return np.zeros_like(heatmap, dtype=np.float32)
+        return ((a - a_min) / (a_max - a_min)).astype(np.float32)
+
+    def _get_threshold_regions(self, norm_heatmap):
+        """Return three binary masks at P99 / P95 / P90 of norm_heatmap.
+
+        R_h — very confident anomaly core  (P99)
+        R_m — likely anomaly region         (P95)
+        R_l — possible anomaly extent       (P90)
+        """
+        Rh = (norm_heatmap >= np.percentile(norm_heatmap, 99)).astype(np.uint8)
+        Rm = (norm_heatmap >= np.percentile(norm_heatmap, 95)).astype(np.uint8)
+        Rl = (norm_heatmap >= np.percentile(norm_heatmap, 90)).astype(np.uint8)
+        return Rh, Rm, Rl
+
+    def _iou(self, a, b):
+        """Pixel-level IoU between two bool/uint8 masks."""
+        inter = float((a & b).sum())
+        union = float((a | b).sum())
+        return inter / union if union > 0 else 0.0
+
     def _sample_points_with_spacing(self, score_map, k, min_spacing, mask=None):
         """Sample k points in descending score order with minimum spacing.
 
@@ -43,27 +76,28 @@ class _SAMRefinerBase:
 
         return np.array([[x, y] for y, x in selected_yx], dtype=np.float32)
 
-    def _get_anomaly_region(self, heatmap):
-        """Threshold heatmap → binary anomaly region R.
+    def _get_anomaly_region(self, norm_heatmap):
+        """Threshold norm_heatmap → binary anomaly region R.
 
-        Uses Otsu when coverage is 1-60 %; falls back to top-10 % percentile.
+        Uses Otsu when coverage is 1-60%; falls back to top-10% percentile.
+        Expects norm_heatmap already in [0, 1] float range.
 
         Returns:
             (H, W) uint8 binary array with values 0/1.
         """
-        h_min, h_max = float(heatmap.min()), float(heatmap.max())
+        h_min, h_max = float(norm_heatmap.min()), float(norm_heatmap.max())
         if h_max - h_min < 1e-8:
-            return np.zeros(heatmap.shape, dtype=np.uint8)
+            return np.zeros(norm_heatmap.shape, dtype=np.uint8)
 
-        hmap_u8 = ((heatmap - h_min) / (h_max - h_min) * 255.0).astype(np.uint8)
+        hmap_u8 = (norm_heatmap * 255.0).astype(np.uint8)
         _, R_otsu = cv2.threshold(hmap_u8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         coverage = float(R_otsu.mean())
 
         if 0.01 <= coverage <= 0.60:
             return R_otsu.astype(np.uint8)
 
-        thresh = np.percentile(heatmap, 90)
-        return (heatmap >= thresh).astype(np.uint8)
+        thresh = np.percentile(norm_heatmap, 90)
+        return (norm_heatmap >= thresh).astype(np.uint8)
 
     def _get_bbox_from_mask(self, mask, heatmap):
         """Bounding box of the connected component with highest mean heatmap score.
@@ -95,28 +129,38 @@ class _SAMRefinerBase:
     def _build_point_arrays(self, heatmap):
         """Build combined pos+neg point arrays from heatmap.
 
-        Returns:
-            point_coords: (N, 2) float32 numpy, xy pixel coords
-            point_labels: (N,) int numpy, 1=foreground 0=background
-            or (None, None) if no positive points found.
-        """
-        R = self._get_anomaly_region(heatmap)
-        if R.sum() == 0:
-            return None, None
+        Applies robust normalization, derives multi-threshold regions, then:
+          - positives: sampled within R_m (falls back to R_l if R_m empty)
+          - negatives: sampled from ring = dilate(R_m) - R_l (avoids uncertain boundary)
 
+        Returns:
+            norm_heatmap: (H, W) float32 robustly normalized to [0, 1]
+            R_l:          (H, W) uint8 low-threshold region (P90)
+            point_coords: (N, 2) float32, or None
+            point_labels: (N,) int, or None
+        """
+        norm_heatmap = self._robust_normalize(heatmap)
+        _Rh, R_m, R_l = self._get_threshold_regions(norm_heatmap)
+
+        if R_m.sum() == 0 and R_l.sum() == 0:
+            return norm_heatmap, R_l, None, None
+
+        # Positive points: within R_m; fall back to R_l when R_m too sparse
+        pos_mask = R_m.astype(bool) if R_m.sum() > 0 else R_l.astype(bool)
         pos_coords = self._sample_points_with_spacing(
-            heatmap, self.k_pos, self.min_spacing_px
+            norm_heatmap, self.k_pos, self.min_spacing_px, mask=pos_mask
         )
         if len(pos_coords) == 0:
-            return None, None
+            return norm_heatmap, R_l, None, None
 
+        # Negative points: ring = dilate(R_m) - R_l  (avoids uncertain boundary)
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (self.dilation_kernel, self.dilation_kernel)
         )
-        dilated = cv2.dilate(R, kernel)
-        ring = (dilated.astype(np.int32) - R.astype(np.int32)) > 0
+        dilated_rm = cv2.dilate(R_m, kernel)
+        ring = (dilated_rm.astype(np.int32) - R_l.astype(np.int32)) > 0
 
-        neg_score_map = np.where(ring, -heatmap, -np.inf)
+        neg_score_map = np.where(ring, -norm_heatmap, -np.inf)
         neg_coords = self._sample_points_with_spacing(
             neg_score_map, self.k_neg, self.min_spacing_px, mask=ring
         )
@@ -130,7 +174,7 @@ class _SAMRefinerBase:
             point_coords = pos_coords
             point_labels = np.ones(len(pos_coords), dtype=int)
 
-        return point_coords, point_labels
+        return norm_heatmap, R_l, point_coords, point_labels
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +186,9 @@ class SAMRefiner(_SAMRefinerBase):
 
     Pass 1: positive + negative points only → M1, logit1
     Pass 2: same points + logit1            → M2, logit2
-    Pass 3: same points + bbox(M2) + logit2 → M3 (final mask)
+    Pass 3: same points + bbox(M2∩R_l) + logit2 → M3 (final mask)
+
+    IoU consistency gate: if IoU(M2, M3) < consistency_iou_threshold, use M2.
     """
 
     def __init__(
@@ -154,6 +200,7 @@ class SAMRefiner(_SAMRefinerBase):
         k_neg: int = 5,
         min_spacing_px: int = 30,
         dilation_kernel: int = 25,
+        consistency_iou_threshold: float = 0.4,
     ):
         from segment_anything import sam_model_registry, SamPredictor
 
@@ -166,6 +213,7 @@ class SAMRefiner(_SAMRefinerBase):
         self.k_neg = k_neg
         self.min_spacing_px = min_spacing_px
         self.dilation_kernel = dilation_kernel
+        self.consistency_iou_threshold = consistency_iou_threshold
 
     def refine(self, image_rgb, heatmap):
         """Run 3-pass SAM cascade to produce a refined binary anomaly mask.
@@ -180,7 +228,7 @@ class SAMRefiner(_SAMRefinerBase):
         H, W = heatmap.shape
         zero_mask = np.zeros((H, W), dtype=np.uint8)
 
-        point_coords, point_labels = self._build_point_arrays(heatmap)
+        norm_heatmap, R_l, point_coords, point_labels = self._build_point_arrays(heatmap)
         if point_coords is None:
             return zero_mask
 
@@ -206,8 +254,12 @@ class SAMRefiner(_SAMRefinerBase):
             M2 = masks2[0]
             logit2 = logits2[0:1]
 
-            # Pass 3: points + bbox(M2) + logit2 → M3
-            box = self._get_bbox_from_mask(M2, heatmap)
+            # Pass 3: points + bbox(M2∩R_l) + logit2 → M3
+            M2_gated = M2 & R_l.astype(bool)
+            box = self._get_bbox_from_mask(M2_gated, norm_heatmap)
+            if box is None:
+                box = self._get_bbox_from_mask(M2, norm_heatmap)
+
             if box is not None:
                 masks3, _, _ = self.predictor.predict(
                     point_coords=point_coords,
@@ -220,7 +272,13 @@ class SAMRefiner(_SAMRefinerBase):
             else:
                 M3 = M2
 
-            return M3.astype(np.uint8)
+            # Consistency gate: revert to M2 if M3 diverges too much
+            if self._iou(M2, M3) < self.consistency_iou_threshold:
+                M_final = M2
+            else:
+                M_final = M3
+
+            return M_final.astype(np.uint8)
 
         except RuntimeError as exc:
             print(f"[SAMRefiner] Warning: {exc}")
@@ -239,7 +297,9 @@ class SAM3Refiner(_SAMRefinerBase):
 
     Pass 1: positive + negative points only → M1, logit1
     Pass 2: same points + logit1            → M2, logit2
-    Pass 3: same points + bbox(M2) + logit2 → M3 (final mask)
+    Pass 3: same points + bbox(M2∩R_l) + logit2 → M3 (final mask)
+
+    IoU consistency gate: if IoU(M2, M3) < consistency_iou_threshold, use M2.
 
     Args:
         model_id: HuggingFace model ID or local path, e.g. "facebook/sam3.1"
@@ -253,6 +313,7 @@ class SAM3Refiner(_SAMRefinerBase):
         k_neg: int = 5,
         min_spacing_px: int = 30,
         dilation_kernel: int = 25,
+        consistency_iou_threshold: float = 0.4,
     ):
         import torch
         from transformers import Sam3TrackerModel, Sam3TrackerProcessor
@@ -269,6 +330,7 @@ class SAM3Refiner(_SAMRefinerBase):
         self.k_neg = k_neg
         self.min_spacing_px = min_spacing_px
         self.dilation_kernel = dilation_kernel
+        self.consistency_iou_threshold = consistency_iou_threshold
 
     def refine(self, image_rgb, heatmap):
         """Run 3-pass SAM3 cascade to produce a refined binary anomaly mask.
@@ -284,7 +346,7 @@ class SAM3Refiner(_SAMRefinerBase):
         H, W = heatmap.shape
         zero_mask = np.zeros((H, W), dtype=np.uint8)
 
-        point_coords, point_labels = self._build_point_arrays(heatmap)
+        norm_heatmap, R_l, point_coords, point_labels = self._build_point_arrays(heatmap)
         if point_coords is None:
             return zero_mask
 
@@ -350,14 +412,24 @@ class SAM3Refiner(_SAMRefinerBase):
             # Pass 2: points + logit feedback
             M2, logit2 = _run_pass(input_masks=logit1)
 
-            # Pass 3: points + bbox(M2) + logit feedback
-            box = self._get_bbox_from_mask(M2, heatmap)
+            # Pass 3: points + bbox(M2∩R_l) + logit feedback
+            M2_gated = M2 & R_l.astype(bool)
+            box = self._get_bbox_from_mask(M2_gated, norm_heatmap)
+            if box is None:
+                box = self._get_bbox_from_mask(M2, norm_heatmap)
+
             if box is not None:
                 M3, _ = _run_pass(input_masks=logit2, box_np=box)
             else:
                 M3 = M2
 
-            return M3.astype(np.uint8)
+            # Consistency gate: revert to M2 if M3 diverges too much
+            if self._iou(M2, M3) < self.consistency_iou_threshold:
+                M_final = M2
+            else:
+                M_final = M3
+
+            return M_final.astype(np.uint8)
 
         except Exception as exc:
             print(f"[SAM3Refiner] Warning: {exc}")
@@ -375,9 +447,9 @@ def create_sam_refiner(version, **kwargs):
         version: "sam1" or "sam3"
         **kwargs: forwarded to the chosen class constructor.
             For sam1: checkpoint_path, model_type, device, k_pos, k_neg,
-                      min_spacing_px, dilation_kernel
+                      min_spacing_px, dilation_kernel, consistency_iou_threshold
             For sam3: model_id, device, k_pos, k_neg,
-                      min_spacing_px, dilation_kernel
+                      min_spacing_px, dilation_kernel, consistency_iou_threshold
 
     Returns:
         SAMRefiner or SAM3Refiner instance.

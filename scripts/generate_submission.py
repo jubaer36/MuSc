@@ -504,6 +504,8 @@ def main():
     parser.add_argument("--sam_dilation",    type=int, default=15)
     parser.add_argument("--gamma_tta",        action="store_true", default=False,
                         help="Run TTA with gamma=0.8 and gamma=1.3 variants, fuse 0.6/0.2/0.2.")
+    parser.add_argument("--sam_iou_threshold", type=float, default=0.4,
+                        help="IoU gate: use M2 instead of M3 when IoU(M2,M3) < this value.")
 
     args = parser.parse_args()
 
@@ -539,6 +541,7 @@ def main():
                 k_neg=args.sam_k_neg,
                 min_spacing_px=args.sam_spacing,
                 dilation_kernel=args.sam_dilation,
+                consistency_iou_threshold=args.sam_iou_threshold,
             )
         else:
             sam_refiner = create_sam_refiner(
@@ -549,6 +552,7 @@ def main():
                 k_neg=args.sam_k_neg,
                 min_spacing_px=args.sam_spacing,
                 dilation_kernel=args.sam_dilation,
+                consistency_iou_threshold=args.sam_iou_threshold,
             )
         print(f"SAM{args.sam_version[-1]} refiner loaded.")
 
