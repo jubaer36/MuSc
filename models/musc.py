@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import numpy as np
@@ -16,7 +17,7 @@ from datasets.btad import _CLASSNAMES as _CLASSNAMES_btad
 
 import models.backbone.open_clip as open_clip
 import models.backbone._backbones as _backbones
-from models.modules._LNAMD import LNAMD
+from models.modules._LNAMD import LNAMD, SNAMD
 from models.modules._MSM import MSM
 from models.modules._RsCIN import RsCIN
 from utils.metrics import compute_metrics, find_best_threshold, compute_segf1_at_threshold
@@ -204,43 +205,42 @@ class MuSc():
             end_time = time.time()
             print('extract time: {}ms per image'.format((end_time-start_time)*1000/subset_num))
             
-            # LNAMD
+            # SNAMD: all r-scales in one pass, concat to 3C, single MSM
             feature_dim = patch_tokens_list[0][0].shape[-1]
-            anomaly_maps_r = torch.tensor([]).double()
-            for r in self.r_list:
-                start_time = time.time()
-                print('aggregation degree: {}'.format(r))
-                LNAMD_r = LNAMD(device=self.device, r=r, feature_dim=feature_dim, feature_layer=self.features_list)
-                Z_layers = {}
-                for im in range(len(patch_tokens_list)):
-                    patch_tokens = [p.to(self.device) for p in patch_tokens_list[im]]
-                    with torch.no_grad(), torch.cuda.amp.autocast():
-                        features = LNAMD_r._embed(patch_tokens)
-                        features /= features.norm(dim=-1, keepdim=True)
-                        for l in range(len(self.features_list)):
-                            # save the aggregated features
-                            if str(l) not in Z_layers.keys():
-                                Z_layers[str(l)] = []
-                            Z_layers[str(l)].append(features[:, :, l, :])
-                end_time = time.time()
-                print('LNAMD-{}: {}ms per image'.format(r, (end_time-start_time)*1000/subset_num))
+            snamd = SNAMD(device=self.device, feature_dim=feature_dim,
+                          feature_layer=self.features_list, r_list=self.r_list)
+            Z_layers = {}
+            start_time = time.time()
+            for im in range(len(patch_tokens_list)):
+                patch_tokens = [p.to(self.device) for p in patch_tokens_list[im]]
+                with torch.no_grad(), torch.cuda.amp.autocast():
+                    # Returns (B, P, L, 3C) already normalized — no .norm() needed
+                    features = snamd._embed(patch_tokens)
+                    for l in range(len(self.features_list)):
+                        if str(l) not in Z_layers:
+                            Z_layers[str(l)] = []
+                        Z_layers[str(l)].append(features[:, :, l, :])  # (B, P, 3C)
+            end_time = time.time()
+            print('SNAMD embed: {}ms per image'.format((end_time-start_time)*1000/subset_num))
+            del snamd
+            gc.collect()
 
-                # MSM
-                anomaly_maps_l = torch.tensor([]).double()
-                start_time = time.time()
-                for l in Z_layers.keys():
-                    # different layers
-                    Z = torch.cat(Z_layers[l], dim=0).to(self.device) # (N, L, C)
-                    print('layer-{} mutual scoring...'.format(l))
-                    anomaly_maps_msm = MSM(Z=Z, device=self.device, topmin_min=0, topmin_max=0.3)
-                    anomaly_maps_l = torch.cat((anomaly_maps_l, anomaly_maps_msm.unsqueeze(0).cpu()), dim=0)
-                    torch.cuda.empty_cache()
-                anomaly_maps_l = torch.mean(anomaly_maps_l, 0)
-                anomaly_maps_r = torch.cat((anomaly_maps_r, anomaly_maps_l.unsqueeze(0)), dim=0)
-                end_time = time.time()
-                print('MSM: {}ms per image'.format((end_time-start_time)*1000/subset_num))
-            anomaly_maps_iter = torch.mean(anomaly_maps_r, 0).to(self.device)
-            del anomaly_maps_r
+            # Single MSM pass per layer (was: per-r MSM × 3)
+            anomaly_maps_l = torch.tensor([]).double()
+            start_time = time.time()
+            for l in sorted(Z_layers.keys()):
+                Z = torch.cat(Z_layers[l], dim=0).to(self.device)  # (N, P, 3C)
+                print('layer-{} mutual scoring (feat_dim={})...'.format(l, Z.shape[-1]))
+                anomaly_maps_msm = MSM(Z=Z, device=self.device, topmin_min=0, topmin_max=0.3)
+                anomaly_maps_l = torch.cat(
+                    (anomaly_maps_l, anomaly_maps_msm.unsqueeze(0).cpu()), dim=0
+                )
+                del Z, anomaly_maps_msm
+                torch.cuda.empty_cache()
+            anomaly_maps_iter = torch.mean(anomaly_maps_l, 0).to(self.device)
+            del anomaly_maps_l, Z_layers
+            end_time = time.time()
+            print('MSM: {}ms per image'.format((end_time-start_time)*1000/subset_num))
             torch.cuda.empty_cache()
 
             # interpolate
