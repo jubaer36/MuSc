@@ -212,16 +212,19 @@ def run_inference(
 
     del embed_model
     gc.collect()
+    torch.cuda.empty_cache()
 
     # Single MSM pass per layer (was: one full MSM pass per r-value × 3)
     print("  MSM ...")
     maps_per_layer = []
     for l_key in sorted(Z_layers.keys()):
+        gc.collect()
+        torch.cuda.empty_cache()
         Z = torch.cat(Z_layers[l_key], dim=0).to(device)  # (N, P, 3C) float16 on GPU
         del Z_layers[l_key]
         torch.cuda.empty_cache()
         print(f"    layer-{l_key} ({Z.shape[0]} imgs, feat_dim={Z.shape[-1]}) ...")
-        maps_msm = MSM(Z=Z, device=device, topmin_min=0, topmin_max=0.3)
+        maps_msm = MSM(Z=Z, device=device, topmin_min=0, topmin_max=0.3, ref_chunk=8)
         maps_per_layer.append(maps_msm.cpu().float())
         del Z, maps_msm
         torch.cuda.empty_cache()

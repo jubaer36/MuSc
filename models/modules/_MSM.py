@@ -86,10 +86,10 @@ def compute_scores_chunked(Z, i, device, topmin_min=0, topmin_max=0.3, ref_chunk
     return torch.mean(vals, dim=1)
 
 
-def MSM(Z, device, topmin_min=0, topmin_max=0.3):
+def MSM(Z, device, topmin_min=0, topmin_max=0.3, ref_chunk=32):
     anomaly_scores_matrix = torch.tensor([]).double().to(device)
     for i in tqdm(range(Z.shape[0])):
-        anomaly_scores_i = compute_scores_chunked(Z, i, device, topmin_min, topmin_max).unsqueeze(0)
+        anomaly_scores_i = compute_scores_chunked(Z, i, device, topmin_min, topmin_max, ref_chunk=ref_chunk).unsqueeze(0)
         anomaly_scores_matrix = torch.cat((anomaly_scores_matrix, anomaly_scores_i.double()), dim=0)
     return anomaly_scores_matrix
 

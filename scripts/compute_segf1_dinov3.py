@@ -79,27 +79,25 @@ def main():
     parser.add_argument("--sam3_model_id",   default="models/sam3",
                         help="SAM3 HuggingFace model ID or local path (used when --sam_version sam3).")
     # Shared args
-    parser.add_argument("--sam_k_pos",       type=int, default=5)
+    parser.add_argument("--sam_k_pos",       type=int, default=2)
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=60)
     parser.add_argument("--sam_dilation",    type=int, default=15)
     parser.add_argument("--sam_iou_threshold", type=float, default=0.4,
                         help="IoU gate: use M2 instead of M3 when IoU(M2,M3) < this value.")
-    parser.add_argument("--gamma_tta",       action="store_true", default=False,
+    parser.add_argument("--gamma_tta",       action="store_true", default=True,
                         help="Run TTA with gamma=0.8 and gamma=1.3 variants, fuse 0.6/0.2/0.2.")
     parser.add_argument("--log_file",        default=None,
                         help="Path to log file. Default: logs/segf1_<timestamp>.log")
     args = parser.parse_args()
 
-    # Set up logging to file + terminal
+    # Set up results-only log (per-class segF1 + global mean)
     if args.log_file is None:
         os.makedirs("logs", exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.log_file = f"logs/segf1_{ts}.log"
     log_fh = open(args.log_file, "w", buffering=1)
-    sys.stdout = _Tee(sys.__stdout__, log_fh)
-    sys.stderr = _Tee(sys.__stderr__, log_fh)
-    print(f"Logging to: {args.log_file}")
+    print(f"Logging results to: {args.log_file}")
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
@@ -272,14 +270,18 @@ def main():
             f"{category:14s}  {global_thr:>10.6f}  {segf1_g*100:>11.2f}%"
             f"  {cat_thr:>11.6f}  {segf1_c*100:>8.2f}%"
         )
+        log_fh.write(f"{category}: segF1@cls={segf1_c*100:.2f}%\n")
+        log_fh.flush()
 
     n = len(segf1_global_ls)
     if n > 0:
+        global_mean = sum(segf1_cls_ls) / n * 100
         print("-" * 60)
         print(
             f"{'mean':14s}  {global_thr:>10.6f}  {sum(segf1_global_ls)/n*100:>11.2f}%"
-            f"  {'(per-cls)':>11s}  {sum(segf1_cls_ls)/n*100:>8.2f}%"
+            f"  {'(per-cls)':>11s}  {global_mean:>8.2f}%"
         )
+        log_fh.write(f"global_mean_segF1@cls={global_mean:.2f}%\n")
 
     print("\nDone.")
     log_fh.close()
