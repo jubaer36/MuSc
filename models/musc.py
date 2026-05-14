@@ -306,7 +306,7 @@ class MuSc():
                 if m3.sum() == 0:
                     refined_map = hmap
                 else:
-                    refined_map = hmap * m3.astype(np.float32)
+                    refined_map = m3.astype(np.float32)
                 refined.append(refined_map.astype(np.float32)[np.newaxis])
             pr_px_sam = np.stack(refined, axis=0)
             print('SAM refinement done.')

@@ -25,7 +25,9 @@ from scripts.generate_submission import (
     run_inference,
     get_backbone_type,
     sam_refine_maps,
+    sam_refine_maps_ensemble,
 )
+import models.backbone.open_clip as open_clip
 from utils.metrics import find_best_threshold, compute_segf1_at_threshold
 
 import warnings
@@ -61,10 +63,21 @@ def main():
     parser.add_argument("--sam3_model_id",   default="models/sam3",
                         help="SAM3 HuggingFace model ID or local path (used when --sam_version sam3).")
     # Shared args
-    parser.add_argument("--sam_k_pos",       type=int, default=2)
+    parser.add_argument("--sam_k_pos",       type=int, default=5)
     parser.add_argument("--sam_k_neg",       type=int, default=5)
-    parser.add_argument("--sam_spacing",     type=int, default=60)
-    parser.add_argument("--sam_dilation",    type=int, default=15)
+    parser.add_argument("--sam_spacing",     type=int, default=30)
+    parser.add_argument("--sam_dilation",    type=int, default=25)
+    # Dual-backbone ensemble
+    parser.add_argument("--dual_backbone",    action="store_true", default=False,
+                        help="Run CLIP ViT-L alongside DINOv3 for dual-model SAM prompts.")
+    parser.add_argument("--clip_model_name",  default="ViT-L-14-336",
+                        help="CLIP model name for secondary backbone.")
+    parser.add_argument("--clip_pretrained",  default="openai")
+    parser.add_argument("--clip_img_size",    type=int, default=336)
+    parser.add_argument("--clip_features",    type=int, nargs="+", default=[5, 11, 17, 23],
+                        help="CLIP feature layer indices.")
+    parser.add_argument("--output_tag",       default=None,
+                        help="Tag appended to result filenames (e.g. 'ensemble').")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -78,6 +91,16 @@ def main():
     model, preprocess, backbone_type = load_backbone(
         args.backbone_name, args.pretrained, args.img_resize, device
     )
+
+    clip_model_secondary = None
+    clip_preprocess_secondary = None
+    if args.dual_backbone:
+        print(f"\nLoading secondary CLIP backbone ({args.clip_model_name} @ {args.clip_img_size}px) ...")
+        clip_model_secondary, _, clip_preprocess_secondary = open_clip.create_model_and_transforms(
+            args.clip_model_name, args.clip_img_size, pretrained=args.clip_pretrained
+        )
+        clip_model_secondary.to(device).eval()
+        print(f"  CLIP layers: {args.clip_features}")
 
     sam_refiner = None
     if args.use_sam:
@@ -152,7 +175,37 @@ def main():
             continue
 
         if sam_refiner is not None:
-            anomaly_maps = sam_refine_maps(anomaly_maps, image_paths, sam_refiner, args.img_resize)
+            if args.dual_backbone and clip_model_secondary is not None:
+                import datasets.mvtec_ad2 as _mvtec_ad2
+                print(f"  [{category}] Running CLIP secondary inference ...")
+                dataset_clip = _mvtec_ad2.MVTecAD2Dataset(
+                    source=args.data_path,
+                    classname=category,
+                    split=_mvtec_ad2.DatasetSplit.TEST,
+                    resize=args.clip_img_size,
+                    imagesize=args.clip_img_size,
+                    clip_transformer=clip_preprocess_secondary,
+                )
+                anomaly_maps_clip, _ = run_inference(
+                    dataset=dataset_clip,
+                    model=clip_model_secondary,
+                    backbone_type="clip",
+                    features_list=args.clip_features,
+                    r_list=args.r_list,
+                    device=device,
+                    batch_size=args.batch_size,
+                    image_size=args.clip_img_size,
+                    with_masks=False,
+                    output_size=args.img_resize,
+                )
+                del dataset_clip
+                anomaly_maps = sam_refine_maps_ensemble(
+                    anomaly_maps, anomaly_maps_clip,
+                    image_paths, sam_refiner, args.img_resize,
+                )
+                del anomaly_maps_clip
+            else:
+                anomaly_maps = sam_refine_maps(anomaly_maps, image_paths, sam_refiner, args.img_resize)
 
         gt_i32 = gt_masks.astype(np.int32)
         cat_maps[category] = anomaly_maps          # (N, 1, H, W) float32

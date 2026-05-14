@@ -92,6 +92,85 @@ class _SAMRefinerBase:
 
         return best_bbox
 
+    def _build_dual_point_arrays(self, heatmap1, heatmap2):
+        """Build pos/neg point arrays using intersection-for-pos, union-for-neg strategy.
+
+        Pos points: R1 ∩ R2 (both models agree anomalous).
+        Neg ring  : outside R1 ∪ R2 (outside both models' regions).
+        Structurally prevents pos/neg contradiction.
+
+        Returns (None, None) when intersection is too small — caller skips SAM.
+        """
+        R1 = self._get_anomaly_region(heatmap1).astype(bool)
+        R2 = self._get_anomaly_region(heatmap2).astype(bool)
+        print(f"  [dual] R1 coverage={R1.mean():.3f}  R2 coverage={R2.mean():.3f}")
+
+        R_pos   = R1 & R2
+        R_union = R1 | R2
+        min_pos_px = max(1, int(0.005 * R_pos.size))
+        print(f"  [dual] R_pos (strict intersection) coverage={R_pos.mean():.4f}  "
+              f"min_required={min_pos_px}px")
+
+        if R_pos.sum() < min_pos_px:
+            # Soft intersection: 3px dilation smooths Otsu quantization gaps at region edges
+            k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            R_pos_soft = (
+                cv2.dilate(R1.astype(np.uint8), k3).astype(bool) &
+                cv2.dilate(R2.astype(np.uint8), k3).astype(bool)
+            )
+            print(f"  [dual] strict R_pos too small — trying soft intersection "
+                  f"(3px dilation): coverage={R_pos_soft.mean():.4f}")
+            if R_pos_soft.sum() >= min_pos_px:
+                R_pos = R_pos_soft
+                print(f"  [dual] using soft R_pos")
+            else:
+                print(f"  [dual] soft R_pos also too small — no dual prompts for this image")
+                return None, None
+
+        if R_union.mean() > 0.60:
+            print(f"  [dual] R_union covers {R_union.mean():.2%} of image (>60%) — "
+                  f"using R1 only for neg ring to avoid border-only ring")
+            R_union = R1
+
+        def _norm(h):
+            lo, hi = float(h.min()), float(h.max())
+            return (h - lo) / (hi - lo + 1e-8)
+
+        h_combined = _norm(heatmap1) + _norm(heatmap2)
+
+        pos_coords = self._sample_points_with_spacing(
+            h_combined, self.k_pos, self.min_spacing_px, mask=R_pos
+        )
+        print(f"  [dual] pos_coords sampled: {len(pos_coords)} (max={self.k_pos})")
+        if len(pos_coords) == 0:
+            print(f"  [dual] no pos points fit spacing constraint — no dual prompts")
+            return None, None
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (self.dilation_kernel, self.dilation_kernel)
+        )
+        dilated = cv2.dilate(R_union.astype(np.uint8), kernel)
+        ring = (dilated.astype(np.int32) - R_union.astype(np.int32)) > 0
+        print(f"  [dual] neg ring coverage={ring.mean():.4f}")
+
+        neg_score_map = np.where(ring, -h_combined, -np.inf)
+        neg_coords = self._sample_points_with_spacing(
+            neg_score_map, self.k_neg, self.min_spacing_px, mask=ring
+        )
+        print(f"  [dual] neg_coords sampled: {len(neg_coords)} (max={self.k_neg})")
+
+        if len(neg_coords) > 0:
+            point_coords = np.concatenate([pos_coords, neg_coords], axis=0)
+            point_labels = np.array(
+                [1] * len(pos_coords) + [0] * len(neg_coords), dtype=int
+            )
+        else:
+            print(f"  [dual] no neg points — using pos only")
+            point_coords = pos_coords
+            point_labels = np.ones(len(pos_coords), dtype=int)
+
+        return point_coords, point_labels
+
     def _build_point_arrays(self, heatmap):
         """Build combined pos+neg point arrays from heatmap.
 
@@ -167,12 +246,14 @@ class SAMRefiner(_SAMRefinerBase):
         self.min_spacing_px = min_spacing_px
         self.dilation_kernel = dilation_kernel
 
-    def refine(self, image_rgb, heatmap):
+    def refine(self, image_rgb, heatmap, heatmap2=None):
         """Run 3-pass SAM cascade to produce a refined binary anomaly mask.
 
         Args:
             image_rgb: (H, W, 3) uint8 numpy array
-            heatmap:   (H, W) float32 numpy array (MuSc anomaly map)
+            heatmap:   (H, W) float32 numpy array — primary MuSc anomaly map (DINOv3)
+            heatmap2:  (H, W) float32 numpy array — secondary anomaly map (CLIP), optional.
+                       When provided, uses intersection/union dual-prompt strategy.
 
         Returns:
             (H, W) uint8 binary numpy array with values {0, 1}.
@@ -180,7 +261,10 @@ class SAMRefiner(_SAMRefinerBase):
         H, W = heatmap.shape
         zero_mask = np.zeros((H, W), dtype=np.uint8)
 
-        point_coords, point_labels = self._build_point_arrays(heatmap)
+        if heatmap2 is not None:
+            point_coords, point_labels = self._build_dual_point_arrays(heatmap, heatmap2)
+        else:
+            point_coords, point_labels = self._build_point_arrays(heatmap)
         if point_coords is None:
             return zero_mask
 
@@ -270,12 +354,14 @@ class SAM3Refiner(_SAMRefinerBase):
         self.min_spacing_px = min_spacing_px
         self.dilation_kernel = dilation_kernel
 
-    def refine(self, image_rgb, heatmap):
+    def refine(self, image_rgb, heatmap, heatmap2=None):
         """Run 3-pass SAM3 cascade to produce a refined binary anomaly mask.
 
         Args:
             image_rgb: (H, W, 3) uint8 numpy array
-            heatmap:   (H, W) float32 numpy array (MuSc anomaly map)
+            heatmap:   (H, W) float32 numpy array — primary MuSc anomaly map (DINOv3)
+            heatmap2:  (H, W) float32 numpy array — secondary anomaly map (CLIP), optional.
+                       When provided, uses intersection/union dual-prompt strategy.
 
         Returns:
             (H, W) uint8 binary numpy array with values {0, 1}.
@@ -284,7 +370,10 @@ class SAM3Refiner(_SAMRefinerBase):
         H, W = heatmap.shape
         zero_mask = np.zeros((H, W), dtype=np.uint8)
 
-        point_coords, point_labels = self._build_point_arrays(heatmap)
+        if heatmap2 is not None:
+            point_coords, point_labels = self._build_dual_point_arrays(heatmap, heatmap2)
+        else:
+            point_coords, point_labels = self._build_point_arrays(heatmap)
         if point_coords is None:
             return zero_mask
 

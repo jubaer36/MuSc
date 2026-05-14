@@ -19,7 +19,7 @@ testing:
 
 sam:
   use_sam: False
-  version: 'sam1'          # 'sam1' or 'sam3'
+  version: 'sam3'          # 'sam1' or 'sam3'
   # SAM1 settings (used when version: sam1)
   checkpoint: 'models/sam_vit_h.pth'
   model_type: 'vit_h'
@@ -30,6 +30,13 @@ sam:
   k_neg: 5
   min_spacing_px: 30
   dilation_kernel: 25
+
+dual_backbone:
+  enabled: false            # enable with --dual_backbone flag
+  clip_model_name: 'ViT-L-14-336'
+  clip_pretrained: 'openai'
+  clip_img_size: 336        # CLIP native resolution (14px patch → 24×24 grid)
+  clip_features: [5, 11, 17, 23]  # standard CLIP ViT-L layer indices
 
 
 # models['backbone_name'] choice:

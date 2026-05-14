@@ -159,7 +159,7 @@ class PrivateSplitDataset(torch.utils.data.Dataset):
 # ------------------------------------------------------------------
 def run_inference(
     dataset, model, backbone_type, features_list, r_list, device,
-    batch_size, image_size, with_masks=False,
+    batch_size, image_size, with_masks=False, output_size=None,
 ):
     """LNAMD + MSM inference. Returns (anomaly_maps, image_paths[, gt_masks]).
 
@@ -240,8 +240,9 @@ def run_inference(
     del anomaly_maps_r
     B, L = anomaly_maps.shape
     H = int(np.sqrt(L))
+    target_size = output_size if output_size is not None else image_size
     anomaly_maps = F.interpolate(
-        anomaly_maps.view(B, 1, H, H), size=image_size, mode="bilinear", align_corners=True,
+        anomaly_maps.view(B, 1, H, H), size=target_size, mode="bilinear", align_corners=True,
     )
     result = anomaly_maps.cpu().float().numpy()
     del anomaly_maps
@@ -391,6 +392,55 @@ def save_maps(anomaly_maps, image_paths, category, split, submission_dir, thresh
     print(f"    saved {len(anomaly_maps)} maps -> {tiff_dir}")
 
 
+def sam_refine_maps_ensemble(
+    anomaly_maps_primary, anomaly_maps_secondary,
+    image_paths, sam_refiner, image_size,
+):
+    """Dual-model SAM refinement using intersection/union prompt strategy.
+
+    Passes both primary (DINOv3) and secondary (CLIP) heatmaps to sam_refiner.refine()
+    so that _build_dual_point_arrays() selects pos from R_dino ∩ R_clip and
+    neg ring from outside R_dino ∪ R_clip. Output handling is identical to
+    sam_refine_maps (hmap_primary * m3 gating).
+
+    Args:
+        anomaly_maps_primary:   (N, 1, H, W) float32 — DINOv3 heatmaps
+        anomaly_maps_secondary: (N, 1, H, W) float32 — CLIP heatmaps, same spatial size
+        image_paths:  list of str, length N
+        sam_refiner:  SAMRefiner or SAM3Refiner instance
+        image_size:   int, resize resolution for loading source images
+
+    Returns:
+        (N, 1, H, W) float32 numpy
+    """
+    from PIL import Image as PILImage
+    refined = []
+    n = len(image_paths)
+    for i, (amap1, amap2, path) in enumerate(
+        tqdm(
+            zip(anomaly_maps_primary, anomaly_maps_secondary, image_paths),
+            total=n, desc="SAM ensemble refine",
+        )
+    ):
+        print(f"\n[ensemble] image {i+1}/{n}: {path}")
+        img_np = np.array(
+            PILImage.open(path).convert("RGB").resize(
+                (image_size, image_size), PILImage.BILINEAR
+            )
+        )
+        hmap1 = amap1.squeeze()
+        hmap2 = amap2.squeeze()
+        m3 = sam_refiner.refine(img_np, hmap1, hmap2)
+        if m3.sum() == 0:
+            print(f"  [ensemble] SAM empty mask — keeping raw primary heatmap")
+            refined_map = hmap1
+        else:
+            refined_map = hmap1 * m3.astype(np.float32)
+            print(f"  [ensemble] SAM mask coverage={m3.mean():.4f}")
+        refined.append(refined_map.astype(np.float32)[np.newaxis])
+    return np.stack(refined, axis=0)
+
+
 def sam_refine_maps(anomaly_maps, image_paths, sam_refiner, image_size):
     """Refine float anomaly maps using SAM mask as a spatial gate.
 
@@ -459,6 +509,19 @@ def main():
                         help="Default: ./{backbone_short}_sam3_parameter_tuned_submission_folder")
     parser.add_argument("--output_dir",     default=None,
                         help="Default: ./output/mvtec_ad2/{backbone_short}")
+    parser.add_argument("--output_tag",     default=None,
+                        help="Override output/submission dir names with 'ensemble' or custom tag.")
+    # Dual-backbone ensemble args
+    parser.add_argument("--dual_backbone",    action="store_true", default=False,
+                        help="Run CLIP ViT-L alongside DINOv3 for dual-model SAM prompts.")
+    parser.add_argument("--clip_model_name",  default="ViT-L-14-336",
+                        help="CLIP model name for secondary backbone (dual mode).")
+    parser.add_argument("--clip_pretrained",  default="openai",
+                        help="CLIP pretrained weights tag (dual mode).")
+    parser.add_argument("--clip_img_size",    type=int, default=336,
+                        help="CLIP input resolution (dual mode).")
+    parser.add_argument("--clip_features",    type=int, nargs="+", default=[5, 11, 17, 23],
+                        help="CLIP feature layer indices (dual mode).")
     parser.add_argument("--use_sam",         action="store_true", default=True,
                         help="Enable SAM cascaded prompt refinement for segmentation.")
     parser.add_argument("--sam_version",     default="sam3", choices=["sam1", "sam3"],
@@ -481,9 +544,15 @@ def main():
 
     device        = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
-    short          = get_short_name(args.backbone_name)
-    submission_dir = Path(args.submission_dir or f"./{short}_sam3_parameter_tuned_submission_folder")
-    output_dir     = Path(args.output_dir     or f"./output/mvtec_ad2/{short}")
+    short         = get_short_name(args.backbone_name)
+    if args.output_tag:
+        run_tag = args.output_tag
+    elif args.dual_backbone:
+        run_tag = f"ensemble_dinov3_clip"
+    else:
+        run_tag = short
+    submission_dir = Path(args.submission_dir or f"./{run_tag}_sam3_submission_folder")
+    output_dir     = Path(args.output_dir     or f"./output/mvtec_ad2/{run_tag}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Backbone       : {args.backbone_name}")
@@ -497,6 +566,18 @@ def main():
     model, preprocess, backbone_type = load_backbone(
         args.backbone_name, args.pretrained, args.img_resize, device
     )
+
+    clip_model_secondary = None
+    clip_preprocess_secondary = None
+    clip_features_list = None
+    if args.dual_backbone:
+        print(f"\nLoading secondary CLIP backbone ({args.clip_model_name} @ {args.clip_img_size}px) ...")
+        clip_model_secondary, _, clip_preprocess_secondary = open_clip.create_model_and_transforms(
+            args.clip_model_name, args.clip_img_size, pretrained=args.clip_pretrained
+        )
+        clip_model_secondary.to(device).eval()
+        clip_features_list = args.clip_features
+        print(f"  CLIP layers: {clip_features_list}")
 
     sam_refiner = None
     if args.use_sam:
@@ -561,9 +642,36 @@ def main():
             )
 
             if sam_refiner is not None:
-                anomaly_maps = sam_refine_maps(
-                    anomaly_maps, image_paths, sam_refiner, args.img_resize
-                )
+                if args.dual_backbone and clip_model_secondary is not None:
+                    print(f"  Running CLIP secondary inference ...")
+                    dataset_clip = PrivateSplitDataset(
+                        data_path=args.data_path,
+                        category=category,
+                        split=split,
+                        image_size=args.clip_img_size,
+                        transform=clip_preprocess_secondary,
+                    )
+                    anomaly_maps_clip, _ = run_inference(
+                        dataset=dataset_clip,
+                        model=clip_model_secondary,
+                        backbone_type="clip",
+                        features_list=clip_features_list,
+                        r_list=args.r_list,
+                        device=device,
+                        batch_size=args.batch_size,
+                        image_size=args.clip_img_size,
+                        output_size=args.img_resize,
+                    )
+                    del dataset_clip
+                    anomaly_maps = sam_refine_maps_ensemble(
+                        anomaly_maps, anomaly_maps_clip,
+                        image_paths, sam_refiner, args.img_resize,
+                    )
+                    del anomaly_maps_clip
+                else:
+                    anomaly_maps = sam_refine_maps(
+                        anomaly_maps, image_paths, sam_refiner, args.img_resize
+                    )
 
             save_maps(
                 anomaly_maps=anomaly_maps,

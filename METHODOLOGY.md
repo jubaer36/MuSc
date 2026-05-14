@@ -161,28 +161,8 @@ conda run -n clip python3 scripts/compute_segf1_dinov3.py \
 
 ---
 
-## 6. Results (MVTecAD2 test_public)
 
-| Config | Mean SegF1 |
-|--------|-----------|
-| DINOv3-MuSc baseline (no SAM) | baseline |
-| DINOv3-MuSc + cascaded SAM | 7.74% (per-class threshold) |
 
-Per-category breakdown (with SAM, per-class threshold):
-
-| Category | SegF1 |
-|----------|-------|
-| can | 0.00% |
-| fabric | 5.49% |
-| fruit_jelly | 6.52% |
-| rice | 1.05% |
-| sheet_metal | 0.60% |
-| vial | 21.84% |
-| wallplugs | 6.47% |
-| walnuts | 19.93% |
-| **mean** | **7.74%** |
-
-Note: Global threshold collapses to 1.0 (binary mask output from SAM has only {0,1} values; per-class threshold is more meaningful for this output format).
 
 ---
 
@@ -206,3 +186,7 @@ Dataset: MVTecAD2 (VAND 4.0 Industrial Track)
 Primary metric: SegF1 (F1-max-segm, threshold swept dataset-wide)  
 Secondary metric: AUROC-cls (image-level)  
 Setting: Zero-shot (no training on anomaly examples)
+
+
+paper links https://arxiv.org/pdf/2401.16753
+https://arxiv.org/pdf/2510.11028
