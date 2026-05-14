@@ -13,9 +13,27 @@ import argparse
 import gc
 import os
 import sys
+import datetime
 
 import numpy as np
 import torch
+
+
+class _Tee:
+    """Write to both stream and file simultaneously."""
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+    def write(self, data):
+        self._stream.write(data)
+        self._fh.write(data)
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+    def fileno(self):
+        return self._stream.fileno()
+    def isatty(self):
+        return self._stream.isatty()
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
@@ -61,13 +79,25 @@ def main():
     parser.add_argument("--sam3_model_id",   default="models/sam3",
                         help="SAM3 HuggingFace model ID or local path (used when --sam_version sam3).")
     # Shared args
-    parser.add_argument("--sam_k_pos",       type=int, default=2)
+    parser.add_argument("--sam_k_pos",       type=int, default=5)
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=60)
     parser.add_argument("--sam_dilation",    type=int, default=15)
     parser.add_argument("--sam_iou_threshold", type=float, default=0.4,
                         help="IoU gate: use M2 instead of M3 when IoU(M2,M3) < this value.")
+    parser.add_argument("--log_file",        default=None,
+                        help="Path to log file. Default: logs/segf1_<timestamp>.log")
     args = parser.parse_args()
+
+    # Set up logging to file + terminal
+    if args.log_file is None:
+        os.makedirs("logs", exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.log_file = f"logs/segf1_{ts}.log"
+    log_fh = open(args.log_file, "w", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, log_fh)
+    sys.stderr = _Tee(sys.__stderr__, log_fh)
+    print(f"Logging to: {args.log_file}")
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
@@ -224,6 +254,7 @@ def main():
         )
 
     print("\nDone.")
+    log_fh.close()
 
 
 if __name__ == "__main__":

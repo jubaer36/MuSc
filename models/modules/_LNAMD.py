@@ -1,5 +1,6 @@
 """
     PatchMaker, Preprocessing and MeanMapper are copied from https://github.com/amazon-science/patchcore-inspection.
+    SNAMD (Similarity Neighborhood Aggregation with Multi-Degrees) from MuSc-V2.
 """
 
 import numpy as np
@@ -35,13 +36,41 @@ class PatchMaker:
         return unfolded_features
 
 
+class SWPooling(torch.nn.Module):
+    """Similarity-Weighted Pooling from MuSc-V2 SNAMD.
+
+    Weights each neighbor by exp(-||F_neighbor - F_center||^2) before averaging,
+    preserving small anomaly signals that uniform pooling dilutes.
+    r=1 degenerates to identity (only neighbor is the center itself).
+    """
+
+    def __init__(self, r):
+        super(SWPooling, self).__init__()
+        self.r = r
+        self.n_neighbors = r * r
+
+    def forward(self, features):
+        # features: (B*P, C, r, r)
+        BP, C, _, _ = features.shape
+        center = features[:, :, self.r // 2, self.r // 2]       # (BP, C)
+        neigh  = features.reshape(BP, C, -1).permute(0, 2, 1)   # (BP, r*r, C)
+        diff   = neigh - center.unsqueeze(1)                     # (BP, r*r, C)
+        lam    = torch.exp(-(diff ** 2).sum(dim=-1))             # (BP, r*r)
+        # mean(Λ ⊙ F(N)): weighted sum divided by |N| (not by sum of weights)
+        F_agg  = (lam.unsqueeze(-1) * neigh).sum(dim=1) / self.n_neighbors  # (BP, C)
+        return F_agg
+
+
 class Preprocessing(torch.nn.Module):
-    def __init__(self, input_layers, output_dim):
+    def __init__(self, input_layers, output_dim, use_sw_pooling=False, r=3):
         super(Preprocessing, self).__init__()
         self.output_dim = output_dim
         self.preprocessing_modules = torch.nn.ModuleList()
-        for input_layer in input_layers:
-            module = MeanMapper(output_dim)
+        for _ in input_layers:
+            if use_sw_pooling:
+                module = SWPooling(r=r)
+            else:
+                module = MeanMapper(output_dim)
             self.preprocessing_modules.append(module)
 
     def forward(self, features):
@@ -120,7 +149,7 @@ class LNAMD(torch.nn.Module):
             _features = _features.reshape(len(_features), -1, *_features.shape[-3:])
             features_layers[i] = _features
         features_layers = [x.reshape(-1, *x.shape[-3:]) for x in features_layers]
-        
+
         # aggregation
         features_layers = self.LNA(features_layers)
         features_layers = features_layers.reshape(B, -1, *features_layers.shape[-2:])   # (B, L, layer, C)
@@ -128,14 +157,139 @@ class LNAMD(torch.nn.Module):
         return features_layers.detach().cpu()
 
 
+def _spatial_align(features_layers, patch_shapes):
+    """Align all layers to the spatial resolution of the first layer via bilinear interpolation."""
+    ref_num_patches = patch_shapes[0]
+    for i in range(1, len(features_layers)):
+        patch_dims = patch_shapes[i]
+        if patch_dims[0] == ref_num_patches[0] and patch_dims[1] == ref_num_patches[1]:
+            continue
+        _features = features_layers[i]
+        _features = _features.reshape(
+            _features.shape[0], patch_dims[0], patch_dims[1], *_features.shape[2:]
+        )
+        _features = _features.permute(0, -3, -2, -1, 1, 2)
+        perm_base_shape = _features.shape
+        _features = _features.reshape(-1, *_features.shape[-2:])
+        _features = F.interpolate(
+            _features.unsqueeze(1),
+            size=(ref_num_patches[0], ref_num_patches[1]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        _features = _features.squeeze(1)
+        _features = _features.reshape(
+            *perm_base_shape[:-2], ref_num_patches[0], ref_num_patches[1]
+        )
+        _features = _features.permute(0, -2, -1, 1, 2, 3)
+        _features = _features.reshape(len(_features), -1, *_features.shape[-3:])
+        features_layers[i] = _features
+    return features_layers
+
+
+class SNAMD(torch.nn.Module):
+    """Similarity Neighborhood Aggregation with Multi-Degrees (MuSc-V2).
+
+    Replaces LNAMD for zero-shot anomaly detection. Key differences:
+    - SWPooling instead of uniform MeanMapper (preserves small anomaly signals)
+    - All r-scales processed in one _embed call, features concatenated to 3C
+    - Single MSM pass on (N, P, 3C) instead of 3 separate (N, P, C) passes
+
+    _embed() returns (B, P, L, 3C) L2-normalized CPU tensor.
+    Callers do NOT call .norm() on the output.
+    """
+
+    def __init__(self, device, feature_dim=1024, feature_layer=[1, 2, 3, 4],
+                 r_list=[1, 3, 5], patchstride=1):
+        super(SNAMD, self).__init__()
+        self.device = device
+        self.r_list = r_list
+        self.feature_dim = feature_dim
+        self.feature_layer = feature_layer
+        self.patch_makers = {r: PatchMaker(r, stride=patchstride) for r in r_list}
+        # ModuleDict keys must be strings
+        self.processors = torch.nn.ModuleDict({
+            str(r): Preprocessing(feature_layer, feature_dim, use_sw_pooling=True, r=r)
+            for r in r_list
+        })
+
+    def _embed_single_r(self, features, r):
+        """Extract and SWPool neighborhood features for radius r.
+        Returns (B, P, L, C) CPU tensor, NOT normalized.
+        """
+        B = features[0].shape[0]
+        features_layers = []
+        for feature in features:
+            feature = feature[:, 1:, :]  # remove CLS token
+            feature = feature.reshape(
+                B,
+                int(math.sqrt(feature.shape[1])),
+                int(math.sqrt(feature.shape[1])),
+                feature.shape[2],
+            )
+            feature = feature.permute(0, 3, 1, 2)
+            feature = torch.nn.LayerNorm(
+                [feature.shape[1], feature.shape[2], feature.shape[3]]
+            ).to(self.device)(feature)
+            features_layers.append(feature)
+
+        pm = self.patch_makers[r]
+        if r != 1:
+            features_layers = [pm.patchify(x, return_spatial_info=True) for x in features_layers]
+            patch_shapes = [x[1] for x in features_layers]
+            features_layers = [x[0] for x in features_layers]
+        else:
+            patch_shapes = [f.shape[-2:] for f in features_layers]
+            features_layers = [
+                f.reshape(f.shape[0], f.shape[1], -1, 1, 1).permute(0, 2, 1, 3, 4)
+                for f in features_layers
+            ]
+
+        features_layers = _spatial_align(features_layers, patch_shapes)
+        features_layers = [x.reshape(-1, *x.shape[-3:]) for x in features_layers]
+        # each: (B*P, C, r, r)
+
+        proc = self.processors[str(r)]
+        agg = proc(features_layers)                         # (B*P, L, C)
+        agg = agg.reshape(B, -1, *agg.shape[-2:])           # (B, P, L, C)
+        return agg.detach().cpu()
+
+    def _embed(self, features):
+        """Multi-scale SNAMD embed.
+
+        Runs _embed_single_r for each r in r_list, concatenates on the feature
+        dimension, and L2-normalizes the concatenated R*C vector.
+
+        Returns: (B, P, L, len(r_list)*C) float16 CPU tensor, unit-normed on last dim.
+        Callers must NOT apply additional .norm() normalization.
+        float16 is forced explicitly to prevent CPU from silently upcasting norm ops
+        to float32, which would triple CPU RAM and GPU VRAM usage.
+        """
+        agg_per_r = [self._embed_single_r(features, r) for r in self.r_list]
+        combined = torch.cat(agg_per_r, dim=-1).float()     # (B, P, L, R*C) — float32 for stable norm
+        combined = combined / combined.norm(dim=-1, keepdim=True)
+        return combined.half()                               # back to float16: 3C dims, 2 bytes/elem
+
+
 if __name__ == "__main__":
     import time
     device = 'cuda:0'
+
+    # LNAMD backward compat test
     LNAMD_r = LNAMD(device=device, r=3, feature_dim=1024, feature_layer=[1,2,3,4])
     B = 32
-    patch_tokens = [torch.rand((B, 1370, 1024)), torch.rand((B, 1370, 1024)), torch.rand((B, 1370, 1024)), torch.rand((B, 1370, 1024))]
+    patch_tokens = [torch.rand((B, 1370, 1024)) for _ in range(4)]
     patch_tokens = [f.to('cuda:0') for f in patch_tokens]
     s = time.time()
     features = LNAMD_r._embed(patch_tokens)
     e = time.time()
-    print((e-s)*1000/32)
+    print('LNAMD: {:.2f}ms/img, shape={}'.format((e-s)*1000/B, features.shape))
+
+    # SNAMD test
+    snamd = SNAMD(device=device, feature_dim=1024, feature_layer=[1,2,3,4], r_list=[1,3,5])
+    s = time.time()
+    out = snamd._embed(patch_tokens)
+    e = time.time()
+    print('SNAMD: {:.2f}ms/img, shape={}'.format((e-s)*1000/B, out.shape))
+    norms = out.norm(dim=-1)
+    print('SNAMD norms close to 1:', torch.allclose(norms, torch.ones_like(norms), atol=1e-4))

@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.join(_ROOT, "models", "backbone"))
 import models.backbone.open_clip as open_clip
 import models.backbone._backbones as _backbones
 from models.backbone.dinov3_backbone import load_dinov3
-from models.modules._LNAMD import LNAMD
+from models.modules._LNAMD import LNAMD, SNAMD
 from models.modules._MSM import MSM
 from utils.metrics import compute_metrics, find_best_threshold, compute_segf1_at_threshold
 
@@ -161,83 +161,76 @@ def run_inference(
     dataset, model, backbone_type, features_list, r_list, device,
     batch_size, image_size, with_masks=False,
 ):
-    """LNAMD + MSM inference. Returns (anomaly_maps, image_paths[, gt_masks]).
+    """SNAMD + MSM inference. Returns (anomaly_maps, image_paths[, gt_masks]).
 
-    Memory-safe: one forward pass per r-value, no patch_tokens_list accumulation.
-    Peak RAM approx Z_layers for one r-value (float16).
+    Single backbone pass per batch. All r-scales extracted in one _embed call,
+    concatenated to 3C, normalized once, then one MSM pass per layer.
+    Peak VRAM: Z of shape (N, P, 3C) + chunked MSM intermediates.
     """
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True,
     )
 
-    anomaly_maps_r = []
-    image_path_list = None
+    Z_layers = {}
+    image_path_list = []
     collected_masks = [] if with_masks else None
+    embed_model = None  # SNAMD instance, initialized on first batch
 
-    for r_idx, r in enumerate(r_list):
-        print(f"  r={r}: extract + LNAMD ...")
-        paths_this_r = []
-        Z_layers = {}
-        LNAMD_r = None
+    print("  SNAMD extract (all r-scales, single backbone pass) ...")
+    for batch in tqdm(dataloader, desc="  embed", leave=False):
+        image = batch["image"]
+        image_path_list.extend(batch["image_path"])
 
-        for batch in tqdm(dataloader, desc=f"  r={r}", leave=False):
-            image = batch["image"]
-            paths_this_r.extend(batch["image_path"])
+        if with_masks and "mask" in batch:
+            collected_masks.append(batch["mask"])
 
-            if with_masks and r_idx == 0 and "mask" in batch:
-                collected_masks.append(batch["mask"])
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            input_img = image.to(torch.float).to(device)
+            # ONE backbone forward pass per batch (was 3x with per-r loop)
+            patch_tokens = extract_patch_tokens(model, input_img, backbone_type, features_list)
 
-            with torch.no_grad(), torch.cuda.amp.autocast():
-                input_img = image.to(torch.float).to(device)
-                patch_tokens = extract_patch_tokens(model, input_img, backbone_type, features_list)
+            if embed_model is None:
+                feature_dim = patch_tokens[0].shape[-1]
+                embed_model = SNAMD(
+                    device=device,
+                    feature_dim=feature_dim,
+                    feature_layer=features_list,
+                    r_list=r_list,
+                )
 
-                if LNAMD_r is None:
-                    feature_dim = patch_tokens[0].shape[-1]
-                    LNAMD_r = LNAMD(
-                        device=device, r=r,
-                        feature_dim=feature_dim,
-                        feature_layer=features_list,
-                    )
+            # Returns (B, P, L, 3C) already L2-normalized — do NOT call .norm() after
+            features = embed_model._embed(patch_tokens)
 
-                features = LNAMD_r._embed(patch_tokens)
-                features /= features.norm(dim=-1, keepdim=True)
+        for l in range(len(features_list)):
+            key = str(l)
+            if key not in Z_layers:
+                Z_layers[key] = []
+            Z_layers[key].append(features[:, :, l, :])  # (B, P, 3C)
 
-            for l in range(len(features_list)):
-                key = str(l)
-                if key not in Z_layers:
-                    Z_layers[key] = []
-                Z_layers[key].append(features[:, :, l, :])
+        del patch_tokens, features
+        torch.cuda.empty_cache()
 
-            del patch_tokens, features
-            torch.cuda.empty_cache()
+    del embed_model
+    gc.collect()
 
-        if image_path_list is None:
-            image_path_list = paths_this_r
+    # Single MSM pass per layer (was: one full MSM pass per r-value × 3)
+    print("  MSM ...")
+    maps_per_layer = []
+    for l_key in sorted(Z_layers.keys()):
+        Z = torch.cat(Z_layers[l_key], dim=0).to(device)  # (N, P, 3C) float16 on GPU
+        del Z_layers[l_key]
+        torch.cuda.empty_cache()
+        print(f"    layer-{l_key} ({Z.shape[0]} imgs, feat_dim={Z.shape[-1]}) ...")
+        maps_msm = MSM(Z=Z, device=device, topmin_min=0, topmin_max=0.3)
+        maps_per_layer.append(maps_msm.cpu().float())
+        del Z, maps_msm
+        torch.cuda.empty_cache()
 
-        del LNAMD_r
-        gc.collect()
+    del Z_layers
+    gc.collect()
 
-        print(f"  r={r}: MSM ...")
-        maps_per_layer = []
-        for l_key in sorted(Z_layers.keys()):
-            Z = torch.cat(Z_layers[l_key], dim=0).to(device)
-            del Z_layers[l_key]
-            torch.cuda.empty_cache()
-            print(f"    layer-{l_key} ({Z.shape[0]} imgs) ...")
-            maps_msm = MSM(Z=Z, device=device, topmin_min=0, topmin_max=0.3)
-            maps_per_layer.append(maps_msm.cpu().float())
-            del Z, maps_msm
-            torch.cuda.empty_cache()
-
-        del Z_layers
-        gc.collect()
-
-        anomaly_maps_r.append(torch.stack(maps_per_layer, dim=0).mean(0))
-        del maps_per_layer
-        gc.collect()
-
-    anomaly_maps = torch.stack(anomaly_maps_r, dim=0).mean(0).to(device)
-    del anomaly_maps_r
+    anomaly_maps = torch.stack(maps_per_layer, dim=0).mean(0).to(device)  # (N, P)
+    del maps_per_layer
     B, L = anomaly_maps.shape
     H = int(np.sqrt(L))
     anomaly_maps = F.interpolate(
@@ -478,7 +471,6 @@ def main():
     parser.add_argument("--sam_dilation",    type=int, default=15)
     parser.add_argument("--sam_iou_threshold", type=float, default=0.4,
                         help="IoU gate: use M2 instead of M3 when IoU(M2,M3) < this value.")
-
     args = parser.parse_args()
 
     device        = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")

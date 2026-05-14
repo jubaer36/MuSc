@@ -53,7 +53,8 @@ def compute_scores_slow(Z, i, device, topmin_min=0, topmin_max=0.3):
 def compute_scores_chunked(Z, i, device, topmin_min=0, topmin_max=0.3, ref_chunk=32):
     """Same result as compute_scores_fast but processes ref images in chunks.
     Limits peak cdist intermediate to (patch_num, ref_chunk*patch_num) instead of
-    (patch_num, (N-1)*patch_num), reducing peak VRAM from ~2.4 GB to ~0.25 GB for N=321."""
+    (patch_num, (N-1)*patch_num), reducing peak VRAM from ~2.4 GB to ~0.25 GB for N=321.
+    Z should be on GPU (float16 recommended to keep VRAM manageable with 3C features)."""
     image_num, patch_num, c = Z.shape
     Z_i = Z[i]  # (patch_num, c)
     ref_indices = list(range(0, i)) + list(range(i + 1, image_num))
