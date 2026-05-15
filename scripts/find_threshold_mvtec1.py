@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Compute segF1 for DINOv3 on MVTecAD2 test_public using a fixed threshold.
+Find optimal segF1 threshold on MVTec AD1 test split.
 
-Fixed threshold = 0.50 (manually set; no GT-based threshold search).
-Does NOT regenerate private-split submission files.
+Rationale: threshold calibrated on MVTec AD1 (public, independent dataset)
+avoids any leakage from the MVTec AD2 competition test_public split.
+The found threshold is then used as FIXED_THRESHOLD in compute_segf1_dinov3.py.
 """
 
 import argparse
@@ -23,14 +24,15 @@ from scripts.generate_submission import (
     get_backbone_type,
     sam_refine_maps,
 )
-from utils.metrics import compute_segf1_at_threshold
+from utils.metrics import find_best_threshold, compute_segf1_at_threshold
 
 import warnings
 warnings.filterwarnings("ignore")
 
 _CLASSNAMES = [
-    "can", "fabric", "fruit_jelly", "rice",
-    "sheet_metal", "vial", "wallplugs", "walnuts",
+    "bottle", "cable", "capsule", "carpet", "grid",
+    "hazelnut", "leather", "metal_nut", "pill", "screw",
+    "tile", "toothbrush", "transistor", "wood", "zipper",
 ]
 
 
@@ -38,35 +40,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backbone_name", default="facebook/dinov3-vitl16-pretrain-lvd1689m")
     parser.add_argument("--pretrained",    default="openai")
-    parser.add_argument("--data_path",     default="./data/mvtec_ad_2/")
+    parser.add_argument("--data_path",     default="./data/mvtec_anomaly_detection/")
     parser.add_argument("--img_resize",    type=int, default=512)
     parser.add_argument("--feature_layers",type=int, nargs="+", default=[5, 11, 17, 23])
-    parser.add_argument("--r_list",        type=int, nargs="+", default=[1 ,3, 5])
+    parser.add_argument("--r_list",        type=int, nargs="+", default=[1, 3, 5])
     parser.add_argument("--batch_size",    type=int, default=4)
     parser.add_argument("--device",        type=int, default=0)
     parser.add_argument("--classes",       nargs="+", default=_CLASSNAMES)
-    parser.add_argument("--use_sam",         action="store_true", default=True,
-                        help="Enable SAM cascaded prompt refinement for segmentation.")
-    parser.add_argument("--sam_version",     default="sam3", choices=["sam1", "sam3"],
-                        help="SAM backend: 'sam1' (segment_anything) or 'sam3' (Sam3TrackerModel).")
-    # SAM1 args
-    parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth",
-                        help="SAM1 checkpoint path (used when --sam_version sam1).")
-    parser.add_argument("--sam_model_type",  default="vit_h",
-                        help="SAM1 model type: vit_h | vit_l | vit_b.")
-    # SAM3 args
-    parser.add_argument("--sam3_model_id",   default="models/sam3",
-                        help="SAM3 HuggingFace model ID or local path (used when --sam_version sam3).")
-    # Shared args
-    parser.add_argument("--sam_k_pos",       type=int, default=2)
-    parser.add_argument("--sam_k_neg",       type=int, default=5)
-    parser.add_argument("--sam_spacing",     type=int, default=60)
-    parser.add_argument("--sam_dilation",    type=int, default=15)
-    parser.add_argument("--threshold",       type=float, default=0.50,
-                        help="Fixed segmentation threshold (calibrated on MVTec AD1).")
+    parser.add_argument("--use_sam",       action="store_true", default=True)
+    parser.add_argument("--sam_version",   default="sam3", choices=["sam1", "sam3"])
+    parser.add_argument("--sam_checkpoint",default="models/sam_vit_h.pth")
+    parser.add_argument("--sam_model_type",default="vit_h")
+    parser.add_argument("--sam3_model_id", default="models/sam3")
+    parser.add_argument("--sam_k_pos",     type=int, default=2)
+    parser.add_argument("--sam_k_neg",     type=int, default=5)
+    parser.add_argument("--sam_spacing",   type=int, default=60)
+    parser.add_argument("--sam_dilation",  type=int, default=15)
     args = parser.parse_args()
-
-    FIXED_THRESHOLD = args.threshold
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
@@ -74,6 +64,7 @@ def main():
     print(f"Backbone : {args.backbone_name}")
     print(f"Device   : {device}")
     print(f"Layers   : {features_list}  r_list={args.r_list}")
+    print(f"Data     : {args.data_path}")
 
     print("\nLoading backbone ...")
     model, preprocess, backbone_type = load_backbone(
@@ -106,23 +97,24 @@ def main():
             )
         print(f"SAM{args.sam_version[-1]} refiner loaded.")
 
-    import datasets.mvtec_ad2 as mvtec_ad2
+    import datasets.mvtec as mvtec
 
-    # --- Pass 1: inference per category, store maps + GT ---
-    cat_maps  = {}   # category -> (N, 1, H, W) float32 numpy
-    cat_gt    = {}   # category -> (N, H, W) int32 numpy
+    pr_samps = []
+    gt_samps = []
+    cat_maps = {}
+    cat_gt   = {}
 
     print("\n" + "=" * 60)
-    print("Pass 1: inference on test_public")
+    print("Inference on MVTec AD1 test split")
     print("=" * 60)
 
     for category in args.classes:
         print(f"\n[{category}]")
         try:
-            dataset = mvtec_ad2.MVTecAD2Dataset(
+            dataset = mvtec.MVTecDataset(
                 source=args.data_path,
                 classname=category,
-                split=mvtec_ad2.DatasetSplit.TEST,
+                split=mvtec.DatasetSplit.TEST,
                 resize=args.img_resize,
                 imagesize=args.img_resize,
                 clip_transformer=preprocess,
@@ -154,43 +146,67 @@ def main():
             anomaly_maps = sam_refine_maps(anomaly_maps, image_paths, sam_refiner, args.img_resize)
 
         gt_i32 = gt_masks.astype(np.int32)
-        cat_maps[category] = anomaly_maps          # (N, 1, H, W) float32
-        cat_gt[category]   = gt_i32               # (N, H, W) int32
+        cat_maps[category] = anomaly_maps
+        cat_gt[category]   = gt_i32
+
+        pr_flat = anomaly_maps.ravel().astype(np.float32)
+        gt_flat = gt_i32.ravel()
+        n_samp  = min(150_000, len(pr_flat))
+        rng     = np.random.default_rng(42)
+        idx     = rng.choice(len(pr_flat), n_samp, replace=False)
+        pr_samps.append(pr_flat[idx])
+        gt_samps.append(gt_flat[idx])
 
         del dataset, gt_masks
         gc.collect()
         torch.cuda.empty_cache()
 
-    if not cat_maps:
+    if not pr_samps:
         print("ERROR: no valid categories found.")
         return
 
-    print(f"\nFixed threshold: {FIXED_THRESHOLD:.2f}")
+    # Global threshold from MVTec AD1
+    combined_pr  = np.concatenate(pr_samps)
+    combined_gt  = np.concatenate(gt_samps)
+    global_thr   = find_best_threshold(combined_gt, combined_pr)
 
-    # --- Report table ---
-    print("\n" + "=" * 50)
-    print(f"{'Category':14s}  {'Threshold':>9s}  {'segF1':>8s}")
-    print("=" * 50)
+    print(f"\n{'='*60}")
+    print(f"Global threshold (MVTec AD1): {global_thr:.6f}")
+    print(f"{'='*60}")
+    print(f"\n>>> Use FIXED_THRESHOLD = {global_thr:.6f} in compute_segf1_dinov3.py <<<\n")
 
-    segf1_ls = []
+    # Per-category segF1 at this threshold (for sanity check)
+    print(f"{'Category':14s}  {'Threshold':>9s}  {'segF1':>8s}  {'Per-cls thr':>11s}  {'segF1@cls':>9s}")
+    print("-" * 60)
+
+    segf1_global_ls = []
+    segf1_cls_ls    = []
 
     for category in args.classes:
         if category not in cat_maps:
-            print(f"{'  '+category:14s}  (skipped)")
             continue
-
         pr_px = cat_maps[category]
         gt_px = cat_gt[category]
 
-        segf1 = compute_segf1_at_threshold(gt_px, pr_px, FIXED_THRESHOLD)
-        segf1_ls.append(segf1)
+        segf1_g  = compute_segf1_at_threshold(gt_px, pr_px, global_thr)
+        cat_thr  = find_best_threshold(gt_px.ravel(), pr_px.ravel())
+        segf1_c  = compute_segf1_at_threshold(gt_px, pr_px, cat_thr)
 
-        print(f"{category:14s}  {FIXED_THRESHOLD:>9.2f}  {segf1*100:>7.2f}%")
+        segf1_global_ls.append(segf1_g)
+        segf1_cls_ls.append(segf1_c)
 
-    n = len(segf1_ls)
+        print(
+            f"{category:14s}  {global_thr:>9.6f}  {segf1_g*100:>7.2f}%"
+            f"  {cat_thr:>11.6f}  {segf1_c*100:>8.2f}%"
+        )
+
+    n = len(segf1_global_ls)
     if n > 0:
-        print("-" * 50)
-        print(f"{'mean':14s}  {FIXED_THRESHOLD:>9.2f}  {sum(segf1_ls)/n*100:>7.2f}%")
+        print("-" * 60)
+        print(
+            f"{'mean':14s}  {global_thr:>9.6f}  {sum(segf1_global_ls)/n*100:>7.2f}%"
+            f"  {'(per-cls)':>11s}  {sum(segf1_cls_ls)/n*100:>8.2f}%"
+        )
 
     print("\nDone.")
 
