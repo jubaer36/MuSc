@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Compute segF1 for DINOv3 on MVTecAD2 test_public at a fixed threshold.
+Find optimal segF1 threshold on MVTec AD1 test split.
 
-Threshold is calibrated on MVTec AD1 using find_threshold_mvtec1.py and
-passed via --threshold to avoid any leakage from the competition test set.
+Threshold calibrated on MVTec AD1 (public, independent dataset) avoids any
+leakage from the MVTec AD2 competition test_public split. The found threshold
+is then passed via --threshold to compute_segf1_dinov3.py and generate_submission.py.
 
 Usage:
-    # Step 1: find threshold on MVTec AD1
     python scripts/find_threshold_mvtec1.py
-
-    # Step 2: eval on MVTec AD2 test_public with that threshold
-    python scripts/compute_segf1_dinov3.py --threshold 0.357525
 """
 
 import argparse
@@ -29,14 +26,15 @@ from scripts.generate_submission import (
     run_inference,
     sam_refine_maps,
 )
-from utils.metrics import compute_metrics, find_best_threshold, compute_segf1_at_threshold
+from utils.metrics import find_best_threshold, compute_segf1_at_threshold
 
 import warnings
 warnings.filterwarnings("ignore")
 
 _CLASSNAMES = [
-    "can", "fabric", "fruit_jelly", "rice",
-    "sheet_metal", "vial", "wallplugs", "walnuts",
+    "bottle", "cable", "capsule", "carpet", "grid",
+    "hazelnut", "leather", "metal_nut", "pill", "screw",
+    "tile", "toothbrush", "transistor", "wood", "zipper",
 ]
 
 
@@ -44,39 +42,31 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backbone_name", default="facebook/dinov3-vitl16-pretrain-lvd1689m")
     parser.add_argument("--pretrained",    default="openai")
-    parser.add_argument("--data_path",     default="./data/mvtec_ad_2/")
+    parser.add_argument("--data_path",     default="./data/mvtec_anomaly_detection/")
     parser.add_argument("--img_resize",    type=int, default=512)
     parser.add_argument("--feature_layers",type=int, nargs="+", default=[5, 11, 17, 23])
     parser.add_argument("--r_list",        type=int, nargs="+", default=[1, 3, 5])
     parser.add_argument("--batch_size",    type=int, default=4)
     parser.add_argument("--device",        type=int, default=0)
     parser.add_argument("--classes",       nargs="+", default=_CLASSNAMES)
-    parser.add_argument(
-        "--threshold", type=float, default=None,
-        help="Fixed threshold from find_threshold_mvtec1.py. "
-             "If omitted, computed from test_public (not recommended — data leak).",
-    )
-    parser.add_argument("--use_sam",         action="store_true", default=True)
-    parser.add_argument("--sam_version",     default="sam3", choices=["sam1", "sam3"])
-    parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth")
-    parser.add_argument("--sam_model_type",  default="vit_h")
-    parser.add_argument("--sam3_model_id",   default="models/sam3")
-    parser.add_argument("--sam_k_pos",       type=int, default=2)
-    parser.add_argument("--sam_k_neg",       type=int, default=5)
-    parser.add_argument("--sam_spacing",     type=int, default=60)
-    parser.add_argument("--sam_dilation",    type=int, default=15)
+    parser.add_argument("--use_sam",       action="store_true", default=True)
+    parser.add_argument("--sam_version",   default="sam3", choices=["sam1", "sam3"])
+    parser.add_argument("--sam_checkpoint",default="models/sam_vit_h.pth")
+    parser.add_argument("--sam_model_type",default="vit_h")
+    parser.add_argument("--sam3_model_id", default="models/sam3")
+    parser.add_argument("--sam_k_pos",     type=int, default=2)
+    parser.add_argument("--sam_k_neg",     type=int, default=5)
+    parser.add_argument("--sam_spacing",   type=int, default=60)
+    parser.add_argument("--sam_dilation",  type=int, default=15)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
 
-    print(f"Backbone  : {args.backbone_name}")
-    print(f"Device    : {device}")
-    print(f"Layers    : {features_list}  r_list={args.r_list}")
-    if args.threshold is not None:
-        print(f"Threshold : {args.threshold} (fixed, from MVTec AD1)")
-    else:
-        print("Threshold : will be computed from test_public (data leak — use find_threshold_mvtec1.py instead)")
+    print(f"Backbone : {args.backbone_name}")
+    print(f"Device   : {device}")
+    print(f"Layers   : {features_list}  r_list={args.r_list}")
+    print(f"Data     : {args.data_path}")
 
     print("\nLoading backbone ...")
     model, preprocess, backbone_type = load_backbone(
@@ -109,24 +99,24 @@ def main():
             )
         print(f"SAM{args.sam_version[-1]} refiner loaded.")
 
-    import datasets.mvtec_ad2 as mvtec_ad2
+    import datasets.mvtec as mvtec
 
-    cat_maps = {}
-    cat_gt   = {}
     pr_samps = []
     gt_samps = []
+    cat_maps = {}
+    cat_gt   = {}
 
     print("\n" + "=" * 60)
-    print("Inference on test_public")
+    print("Inference on MVTec AD1 test split")
     print("=" * 60)
 
     for category in args.classes:
         print(f"\n[{category}]")
         try:
-            dataset = mvtec_ad2.MVTecAD2Dataset(
+            dataset = mvtec.MVTecDataset(
                 source=args.data_path,
                 classname=category,
-                split=mvtec_ad2.DatasetSplit.TEST,
+                split=mvtec.DatasetSplit.TEST,
                 resize=args.img_resize,
                 imagesize=args.img_resize,
                 clip_transformer=preprocess,
@@ -161,82 +151,62 @@ def main():
         cat_maps[category] = anomaly_maps
         cat_gt[category]   = gt_i32
 
-        if args.threshold is None:
-            pr_flat = anomaly_maps.ravel().astype(np.float32)
-            gt_flat = gt_i32.ravel()
-            n_samp  = min(150_000, len(pr_flat))
-            rng     = np.random.default_rng(42)
-            idx     = rng.choice(len(pr_flat), n_samp, replace=False)
-            pr_samps.append(pr_flat[idx])
-            gt_samps.append(gt_flat[idx])
+        pr_flat = anomaly_maps.ravel().astype(np.float32)
+        gt_flat = gt_i32.ravel()
+        n_samp  = min(150_000, len(pr_flat))
+        rng     = np.random.default_rng(42)
+        idx     = rng.choice(len(pr_flat), n_samp, replace=False)
+        pr_samps.append(pr_flat[idx])
+        gt_samps.append(gt_flat[idx])
 
         del dataset, gt_masks
         gc.collect()
         torch.cuda.empty_cache()
 
-    if not cat_maps:
+    if not pr_samps:
         print("ERROR: no valid categories found.")
         return
 
-    # Determine threshold
-    if args.threshold is not None:
-        global_thr = args.threshold
-    else:
-        combined_pr = np.concatenate(pr_samps)
-        combined_gt = np.concatenate(gt_samps)
-        global_thr  = find_best_threshold(combined_gt, combined_pr)
-        print(f"\nGlobal threshold (from test_public): {global_thr:.6f}")
+    combined_pr = np.concatenate(pr_samps)
+    combined_gt = np.concatenate(gt_samps)
+    global_thr  = find_best_threshold(combined_gt, combined_pr)
 
-    # Report table
-    print("\n" + "=" * 75)
-    print(f"{'Category':14s}  {'segF1@thr':>9s}  {'AUROC-px':>8s}  {'AUROC-im':>8s}  {'AUPRO':>7s}  {'Per-cls thr':>11s}  {'segF1@cls':>9s}")
-    print("=" * 75)
+    print(f"\n{'='*60}")
+    print(f"Global threshold (MVTec AD1): {global_thr:.6f}")
+    print(f"{'='*60}")
+    print(f"\n>>> Pass --threshold {global_thr:.6f} to compute_segf1_dinov3.py and generate_submission.py <<<\n")
+
+    print(f"{'Category':14s}  {'Threshold':>9s}  {'segF1':>8s}  {'Per-cls thr':>11s}  {'segF1@cls':>9s}")
+    print("-" * 60)
 
     segf1_global_ls = []
     segf1_cls_ls    = []
-    auroc_px_ls     = []
-    auroc_sp_ls     = []
-    aupro_ls        = []
 
     for category in args.classes:
         if category not in cat_maps:
-            print(f"{'  '+category:14s}  (skipped)")
             continue
-
         pr_px = cat_maps[category]
         gt_px = cat_gt[category]
 
         segf1_g = compute_segf1_at_threshold(gt_px, pr_px, global_thr)
-
-        pr_sp = pr_px.reshape(pr_px.shape[0], -1).max(axis=1)
-        gt_sp = (gt_px.reshape(gt_px.shape[0], -1).sum(axis=1) > 0).astype(np.int32)
-        (auroc_sp, _, _), (auroc_px, _, _, aupro) = compute_metrics(
-            gt_sp=gt_sp, pr_sp=pr_sp, gt_px=gt_px, pr_px=pr_px
-        )
-
         cat_thr = find_best_threshold(gt_px.ravel(), pr_px.ravel())
         segf1_c = compute_segf1_at_threshold(gt_px, pr_px, cat_thr)
 
         segf1_global_ls.append(segf1_g)
         segf1_cls_ls.append(segf1_c)
-        auroc_px_ls.append(auroc_px)
-        auroc_sp_ls.append(auroc_sp)
-        aupro_ls.append(aupro)
 
         print(
-            f"{category:14s}  {segf1_g*100:>8.2f}%  {auroc_px*100:>7.2f}%  {auroc_sp*100:>7.2f}%"
-            f"  {aupro*100:>6.2f}%  {cat_thr:>11.6f}  {segf1_c*100:>8.2f}%"
+            f"{category:14s}  {global_thr:>9.6f}  {segf1_g*100:>7.2f}%"
+            f"  {cat_thr:>11.6f}  {segf1_c*100:>8.2f}%"
         )
 
     n = len(segf1_global_ls)
     if n > 0:
-        print("-" * 75)
+        print("-" * 60)
         print(
-            f"{'mean':14s}  {sum(segf1_global_ls)/n*100:>8.2f}%  {sum(auroc_px_ls)/n*100:>7.2f}%"
-            f"  {sum(auroc_sp_ls)/n*100:>7.2f}%  {sum(aupro_ls)/n*100:>6.2f}%"
+            f"{'mean':14s}  {global_thr:>9.6f}  {sum(segf1_global_ls)/n*100:>7.2f}%"
             f"  {'(per-cls)':>11s}  {sum(segf1_cls_ls)/n*100:>8.2f}%"
         )
-        print(f"\nFixed threshold used: {global_thr:.6f}")
 
     print("\nDone.")
 

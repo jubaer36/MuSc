@@ -5,8 +5,8 @@ Generate MVTec AD2 competition submission files.
 Modular backbone: CLIP (ViT-*) | DINOv2 (dinov2_*) | DINO (dino_*) |
                   DINOv3 (facebook/dinov3-* via HuggingFace)
 
-Threshold: pass --threshold VALUE to use a fixed value, or omit (default=None)
-to auto-compute from test_public images (Phase 1) and report metrics.
+Threshold: must be passed via --threshold (calibrate using find_threshold_mvtec1.py
+on an independent dataset).
 
 Output layout:
   {backbone}_submission_folder/
@@ -39,7 +39,7 @@ import models.backbone._backbones as _backbones
 from models.backbone.dinov3_backbone import load_dinov3
 from models.modules._LNAMD import LNAMD
 from models.modules._MSM import MSM
-from utils.metrics import compute_metrics, find_best_threshold, compute_segf1_at_threshold
+from utils.metrics import compute_metrics, compute_segf1_at_threshold
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -255,145 +255,6 @@ def run_inference(
 
 
 # ------------------------------------------------------------------
-# Phase 1: compute threshold from test_public
-# ------------------------------------------------------------------
-def compute_threshold_from_public(args, model, preprocess, backbone_type, device, sam_refiner=None):
-    import datasets.mvtec_ad2 as mvtec_ad2
-
-    features_list = [l + 1 for l in args.feature_layers]
-
-    print("\n" + "=" * 60)
-    print("Phase 1: computing threshold from test_public")
-    print("=" * 60)
-
-    auroc_sp_ls, f1_sp_ls, ap_sp_ls = [], [], []
-    auroc_px_ls, f1_px_ls, ap_px_ls, aupro_ls = [], [], [], []
-    pr_samples, gt_samples = [], []
-    valid_cats = []
-
-    for category in args.classes:
-        print(f"\n  [{category}]")
-        try:
-            dataset = mvtec_ad2.MVTecAD2Dataset(
-                source=args.data_path,
-                classname=category,
-                split=mvtec_ad2.DatasetSplit.TEST,
-                resize=args.img_resize,
-                imagesize=args.img_resize,
-                clip_transformer=preprocess,
-            )
-        except Exception as e:
-            print(f"  Skipping ({e})")
-            continue
-        if len(dataset) == 0:
-            print("  No images, skipping.")
-            continue
-
-        if args.gamma_tta:
-            from utils.gamma_tta import GammaPreprocess, fuse_gamma_heatmaps
-
-            def _make_ds_pub(gamma):
-                pp = GammaPreprocess(preprocess, gamma) if gamma != 1.0 else preprocess
-                return mvtec_ad2.MVTecAD2Dataset(
-                    source=args.data_path, classname=category,
-                    split=mvtec_ad2.DatasetSplit.TEST,
-                    resize=args.img_resize, imagesize=args.img_resize,
-                    clip_transformer=pp,
-                )
-
-            _inf_kwargs_pub = dict(
-                model=model, backbone_type=backbone_type,
-                features_list=features_list, r_list=args.r_list,
-                device=device, batch_size=args.batch_size,
-                image_size=args.img_resize,
-            )
-            maps_o, image_paths, gt_masks = run_inference(
-                dataset=_make_ds_pub(1.0), with_masks=True, **_inf_kwargs_pub
-            )
-            maps_b, _ = run_inference(dataset=_make_ds_pub(0.8), **_inf_kwargs_pub)
-            maps_d, _ = run_inference(dataset=_make_ds_pub(1.3), **_inf_kwargs_pub)
-            anomaly_maps = fuse_gamma_heatmaps([maps_o, maps_b, maps_d])
-            del maps_o, maps_b, maps_d
-        else:
-            anomaly_maps, image_paths, gt_masks = run_inference(
-                dataset=dataset,
-                model=model,
-                backbone_type=backbone_type,
-                features_list=features_list,
-                r_list=args.r_list,
-                device=device,
-                batch_size=args.batch_size,
-                image_size=args.img_resize,
-                with_masks=True,
-            )
-
-        gt_px = gt_masks.astype(np.int32) if gt_masks is not None else None
-        pr_sp = anomaly_maps.reshape(len(anomaly_maps), -1).max(-1)
-        gt_sp = (
-            (gt_px.reshape(len(gt_px), -1).max(-1) > 0).astype(np.int32)
-            if gt_px is not None else None
-        )
-
-        # Metrics computed on raw float heatmaps (before SAM) for valid AUROC/AUPRO
-        image_metric, pixel_metric = compute_metrics(gt_sp, pr_sp, gt_px, anomaly_maps)
-        auroc_sp, f1_sp, ap_sp = image_metric
-        auroc_px, f1_px, ap_px, aupro = pixel_metric
-
-        auroc_sp_ls.append(auroc_sp); f1_sp_ls.append(f1_sp); ap_sp_ls.append(ap_sp)
-        auroc_px_ls.append(auroc_px); f1_px_ls.append(f1_px)
-        ap_px_ls.append(ap_px);       aupro_ls.append(aupro)
-        valid_cats.append(category)
-
-        # SAM refinement for threshold computation only
-        if sam_refiner is not None:
-            anomaly_maps = sam_refine_maps(anomaly_maps, image_paths, sam_refiner, args.img_resize)
-
-        pr_px = anomaly_maps
-        n_px = pr_px.ravel().shape[0]
-        n_samp = min(150_000, n_px)
-        rng = np.random.default_rng(42)
-        idx = rng.choice(n_px, n_samp, replace=False)
-        pr_samples.append(pr_px.ravel()[idx].astype(np.float32))
-        if gt_px is not None:
-            gt_samples.append(gt_px.ravel()[idx].astype(np.int32))
-
-        del anomaly_maps, gt_masks, pr_px, gt_px
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    if not pr_samples:
-        raise RuntimeError("No test_public data found.")
-
-    combined_pr = np.concatenate(pr_samples)
-    combined_gt = np.concatenate(gt_samples) if gt_samples else None
-    if combined_gt is None or combined_gt.sum() == 0:
-        raise RuntimeError("No anomalous pixels in test_public GT.")
-
-    threshold = find_best_threshold(combined_gt, combined_pr)
-    del combined_pr, combined_gt, pr_samples, gt_samples
-
-    print(f"\n  Global threshold: {threshold:.6f}")
-    print("\n  Per-category metrics (test_public):")
-    for i, cat in enumerate(valid_cats):
-        print(
-            f"  {cat:12s}  "
-            f"auroc_px:{auroc_px_ls[i]*100:.1f}  f1_max:{f1_px_ls[i]*100:.1f}  "
-            f"ap:{ap_px_ls[i]*100:.1f}  aupro:{aupro_ls[i]*100:.1f}  "
-            f"auroc_sp:{auroc_sp_ls[i]*100:.1f}  f1_sp:{f1_sp_ls[i]*100:.1f}"
-        )
-    n = len(valid_cats)
-    if n > 0:
-        print(
-            f"  {chr(39)+'mean'+chr(39):12s}  "
-            f"auroc_px:{sum(auroc_px_ls)/n*100:.1f}  f1_max:{sum(f1_px_ls)/n*100:.1f}  "
-            f"ap:{sum(ap_px_ls)/n*100:.1f}  aupro:{sum(aupro_ls)/n*100:.1f}  "
-            f"auroc_sp:{sum(auroc_sp_ls)/n*100:.1f}  f1_sp:{sum(f1_sp_ls)/n*100:.1f}"
-        )
-
-    return threshold
-
-
-# ------------------------------------------------------------------
 # save helpers
 # ------------------------------------------------------------------
 def save_maps(anomaly_maps, image_paths, category, split, submission_dir, threshold):
@@ -446,7 +307,6 @@ def sam_refine_maps(anomaly_maps, image_paths, sam_refiner, image_size):
         hmap = amap.squeeze()
         m3 = sam_refiner.refine(img_np, hmap)  # (H, W) uint8 {0,1}
         if m3.sum() == 0:
-            # SAM found no region (flat/normal heatmap) — keep raw heatmap
             refined_map = hmap
         else:
             refined_map = hmap * m3.astype(np.float32)
@@ -471,46 +331,41 @@ def main():
     )
     parser.add_argument("--pretrained",     default="openai",
                         help="Pretrained weights tag (CLIP only).")
-    parser.add_argument("--img_resize",     type=int, default=518,
+    parser.add_argument("--img_resize",     type=int, default=512,
                         help="Resize resolution. Use 512 for DINOv3 (patch_size=16).")
     parser.add_argument("--feature_layers", type=int, nargs="+", default=[5, 11, 17, 23])
     parser.add_argument("--r_list",         type=int, nargs="+", default=[1, 3, 5])
     parser.add_argument("--batch_size",     type=int, default=4)
     parser.add_argument("--device",         type=int, default=0)
     parser.add_argument(
-        "--threshold", type=float, default=None,
-        help="Fixed threshold. Omit to auto-compute from test_public.",
+        "--threshold", type=float, required=True,
+        help="Fixed threshold calibrated on MVTec AD1 via find_threshold_mvtec1.py.",
     )
     parser.add_argument("--submission_dir", default=None,
-                        help="Default: ./{backbone_short}_sam3_parameter_tuned_submission_folder")
+                        help="Default: ./{backbone_short}_sam3_submission_folder")
     parser.add_argument("--output_dir",     default=None,
                         help="Default: ./output/mvtec_ad2/{backbone_short}")
     parser.add_argument("--use_sam",         action="store_true", default=True,
                         help="Enable SAM cascaded prompt refinement for segmentation.")
     parser.add_argument("--sam_version",     default="sam3", choices=["sam1", "sam3"],
                         help="SAM backend: 'sam1' (segment_anything) or 'sam3' (Sam3TrackerModel).")
-    # SAM1 args
     parser.add_argument("--sam_checkpoint",  default="models/sam_vit_h.pth",
                         help="SAM1 checkpoint path (used when --sam_version sam1).")
     parser.add_argument("--sam_model_type",  default="vit_h",
                         help="SAM1 model type: vit_h | vit_l | vit_b.")
-    # SAM3 args
     parser.add_argument("--sam3_model_id",   default="models/sam3",
                         help="SAM3 HuggingFace model ID or local path (used when --sam_version sam3).")
-    # Shared args
     parser.add_argument("--sam_k_pos",       type=int, default=2)
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=60)
     parser.add_argument("--sam_dilation",    type=int, default=15)
-    parser.add_argument("--gamma_tta",        action="store_true", default=False,
-                        help="Run TTA with gamma=0.8 and gamma=1.3 variants, fuse 0.6/0.2/0.2.")
 
     args = parser.parse_args()
 
     device        = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     features_list = [l + 1 for l in args.feature_layers]
     short          = get_short_name(args.backbone_name)
-    submission_dir = Path(args.submission_dir or f"./{short}_sam3_parameter_tuned_submission_folder")
+    submission_dir = Path(args.submission_dir or f"./{short}_sam3_submission_folder")
     output_dir     = Path(args.output_dir     or f"./output/mvtec_ad2/{short}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -518,8 +373,7 @@ def main():
     print(f"Submission dir : {submission_dir}")
     print(f"Output dir     : {output_dir}")
     print(f"Device         : {device}")
-    thr_str = "auto (Phase 1)" if args.threshold is None else str(args.threshold)
-    print(f"Threshold      : {thr_str}")
+    print(f"Threshold      : {args.threshold}")
 
     print("\nLoading backbone ...")
     model, preprocess, backbone_type = load_backbone(
@@ -552,17 +406,8 @@ def main():
             )
         print(f"SAM{args.sam_version[-1]} refiner loaded.")
 
-    if args.threshold is None:
-        threshold = compute_threshold_from_public(
-            args, model, preprocess, backbone_type, device, sam_refiner=sam_refiner
-        )
-    else:
-        threshold = args.threshold
-
-    print(f"\nThreshold used : {threshold:.6f}")
-
     print("\n" + "=" * 60)
-    print("Phase 2: generating submission files")
+    print("Generating submission files")
     print("=" * 60)
 
     for category in args.classes:
@@ -577,41 +422,16 @@ def main():
             )
             print(f"  {len(dataset)} images")
 
-            if args.gamma_tta:
-                from utils.gamma_tta import GammaPreprocess, fuse_gamma_heatmaps
-
-                def _make_ds_priv(gamma):
-                    pp = GammaPreprocess(preprocess, gamma) if gamma != 1.0 else preprocess
-                    return PrivateSplitDataset(
-                        data_path=args.data_path,
-                        category=category,
-                        split=split,
-                        image_size=args.img_resize,
-                        transform=pp,
-                    )
-
-                _inf_kwargs_priv = dict(
-                    model=model, backbone_type=backbone_type,
-                    features_list=features_list, r_list=args.r_list,
-                    device=device, batch_size=args.batch_size,
-                    image_size=args.img_resize,
-                )
-                maps_o, image_paths = run_inference(dataset=_make_ds_priv(1.0), **_inf_kwargs_priv)
-                maps_b, _ = run_inference(dataset=_make_ds_priv(0.8), **_inf_kwargs_priv)
-                maps_d, _ = run_inference(dataset=_make_ds_priv(1.3), **_inf_kwargs_priv)
-                anomaly_maps = fuse_gamma_heatmaps([maps_o, maps_b, maps_d])
-                del maps_o, maps_b, maps_d
-            else:
-                anomaly_maps, image_paths = run_inference(
-                    dataset=dataset,
-                    model=model,
-                    backbone_type=backbone_type,
-                    features_list=features_list,
-                    r_list=args.r_list,
-                    device=device,
-                    batch_size=args.batch_size,
-                    image_size=args.img_resize,
-                )
+            anomaly_maps, image_paths = run_inference(
+                dataset=dataset,
+                model=model,
+                backbone_type=backbone_type,
+                features_list=features_list,
+                r_list=args.r_list,
+                device=device,
+                batch_size=args.batch_size,
+                image_size=args.img_resize,
+            )
 
             if sam_refiner is not None:
                 anomaly_maps = sam_refine_maps(
@@ -624,7 +444,7 @@ def main():
                 category=category,
                 split=split,
                 submission_dir=submission_dir,
-                threshold=threshold,
+                threshold=args.threshold,
             )
 
             del anomaly_maps, image_paths, dataset
