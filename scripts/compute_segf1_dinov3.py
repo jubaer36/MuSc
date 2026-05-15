@@ -2,7 +2,8 @@
 """
 Compute segF1 for DINOv3 on MVTecAD2 test_public using a fixed threshold.
 
-Fixed threshold = 0.50 (manually set; no GT-based threshold search).
+Threshold must be passed via --threshold (calibrate on independent dataset
+using find_threshold_mvtec1.py or find_threshold_visa.py).
 Does NOT regenerate private-split submission files.
 """
 
@@ -62,8 +63,8 @@ def main():
     parser.add_argument("--sam_k_neg",       type=int, default=5)
     parser.add_argument("--sam_spacing",     type=int, default=60)
     parser.add_argument("--sam_dilation",    type=int, default=15)
-    parser.add_argument("--threshold",       type=float, default=0.50,
-                        help="Fixed segmentation threshold (calibrated on MVTec AD1).")
+    parser.add_argument("--threshold",       type=float, required=True,
+                        help="Fixed segmentation threshold (calibrate via find_threshold_mvtec1.py or find_threshold_visa.py).")
     args = parser.parse_args()
 
     FIXED_THRESHOLD = args.threshold
