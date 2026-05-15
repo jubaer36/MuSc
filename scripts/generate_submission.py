@@ -332,7 +332,7 @@ def main():
     )
     parser.add_argument("--pretrained",     default="openai",
                         help="Pretrained weights tag (CLIP only).")
-    parser.add_argument("--img_resize",     type=int, default=518,
+    parser.add_argument("--img_resize",     type=int, default=512,
                         help="Resize resolution. Use 512 for DINOv3 (patch_size=16).")
     parser.add_argument("--feature_layers", type=int, nargs="+", default=[5, 11, 17, 23])
     parser.add_argument("--r_list",         type=int, nargs="+", default=[1, 3, 5])
@@ -343,7 +343,7 @@ def main():
         help="Fixed threshold calibrated on an independent dataset (e.g. MVTec AD1 or VisA).",
     )
     parser.add_argument("--submission_dir", default=None,
-                        help="Default: ./{backbone_short}_sam3_parameter_tuned_submission_folder")
+                        help="Default: ./{backbone_short}_sam3.357525_submission_folder")
     parser.add_argument("--output_dir",     default=None,
                         help="Default: ./output/mvtec_ad2/{backbone_short}")
     parser.add_argument("--use_sam",         action="store_true", default=True,

@@ -25,7 +25,7 @@ from scripts.generate_submission import (
     run_inference,
     sam_refine_maps,
 )
-from utils.metrics import compute_segf1_at_threshold
+from utils.metrics import compute_metrics, compute_segf1_at_threshold
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -105,26 +105,48 @@ def run_dataset(
 
 
 def report_segf1(label, classes, cat_maps, cat_gt, threshold):
-    """Print per-category segF1 table and return mean segF1."""
-    print(f"\n{'='*55}")
+    """Print per-category full metrics table and return mean segF1."""
+    print(f"\n{'='*90}")
     print(f"  {label}  |  threshold={threshold:.6f}")
-    print(f"{'='*55}")
-    print(f"  {'Category':16s}  {'segF1':>8s}")
-    print(f"  {'-'*28}")
+    print(f"{'='*90}")
+    hdr = f"  {'Category':16s}  {'segF1':>7s}  {'AUROC-px':>8s}  {'AUROC-im':>8s}  {'AP-px':>7s}  {'AP-im':>7s}  {'AUPRO':>7s}  {'F1-px':>7s}"
+    print(hdr)
+    print(f"  {'-'*84}")
 
     scores = []
+    metric_cols = {k: [] for k in ["auroc_px", "auroc_sp", "ap_px", "ap_sp", "aupro", "f1_px"]}
+
     for cat in classes:
         if cat not in cat_maps:
             print(f"  {'  '+cat:16s}  (skipped)")
             continue
-        segf1 = compute_segf1_at_threshold(cat_gt[cat], cat_maps[cat], threshold)
+
+        pr_px = cat_maps[cat]   # (N,1,H,W) or (N,H,W)
+        gt_px = cat_gt[cat]     # (N,...) int32
+
+        segf1 = compute_segf1_at_threshold(gt_px, pr_px, threshold)
         scores.append(segf1)
-        print(f"  {cat:16s}  {segf1*100:>7.2f}%")
+
+        pr_flat = pr_px.reshape(pr_px.shape[0], -1)
+        gt_flat = gt_px.reshape(gt_px.shape[0], -1)
+        pr_sp = pr_flat.max(axis=1)
+        gt_sp = (gt_flat.sum(axis=1) > 0).astype(np.int32)
+
+        (auroc_sp, f1_sp, ap_sp), (auroc_px, f1_px, ap_px, aupro) = compute_metrics(
+            gt_sp=gt_sp, pr_sp=pr_sp, gt_px=gt_px, pr_px=pr_px
+        )
+
+        for k, v in zip(["auroc_px", "auroc_sp", "ap_px", "ap_sp", "aupro", "f1_px"],
+                        [auroc_px, auroc_sp, ap_px, ap_sp, aupro, f1_px]):
+            metric_cols[k].append(v)
+
+        print(f"  {cat:16s}  {segf1*100:>6.2f}%  {auroc_px*100:>7.2f}%  {auroc_sp*100:>7.2f}%  {ap_px*100:>6.2f}%  {ap_sp*100:>6.2f}%  {aupro*100:>6.2f}%  {f1_px*100:>6.2f}%")
 
     if scores:
         mean = sum(scores) / len(scores)
-        print(f"  {'-'*28}")
-        print(f"  {'mean':16s}  {mean*100:>7.2f}%")
+        means = {k: sum(v) / len(v) for k, v in metric_cols.items() if v}
+        print(f"  {'-'*84}")
+        print(f"  {'mean':16s}  {mean*100:>6.2f}%  {means['auroc_px']*100:>7.2f}%  {means['auroc_sp']*100:>7.2f}%  {means['ap_px']*100:>6.2f}%  {means['ap_sp']*100:>6.2f}%  {means['aupro']*100:>6.2f}%  {means['f1_px']*100:>6.2f}%")
         return mean
     return 0.0
 
